@@ -1,2 +1,7 @@
 zk/target/
 zk/.env
+orchestrator/check_keypairs.js
+orchestrator/check_program.js
+orchestrator/check_state.js
+orchestrator/init_program.js
+contracts/solana/maat/target/

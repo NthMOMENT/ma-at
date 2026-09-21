@@ -16,6 +16,7 @@ const ROBINHOOD_RPC_URL = process.env.ROBINHOOD_RPC_URL ?? "https://rpc.testnet.
 
 // Path to the compiled SP1 prover binary
 const PROVER_BINARY = process.env.PROVER_BINARY_PATH ?? path.resolve(__dirname, "../../zk/target/release/prove");
+const SETTLE_SCRIPT = process.env.SETTLE_SCRIPT_PATH ?? path.resolve(__dirname, "../settle_intent.js");
 
 if (!ALCHEMY_RPC_URL_1 || !ALCHEMY_RPC_URL_2) {
   console.error("[FATAL] ALCHEMY_RPC_URL_1 and ALCHEMY_RPC_URL_2 must both be set in .env");
@@ -124,6 +125,38 @@ function triggerZKVerification(intentId: string, blockNumber: string): void {
     console.log(`[ZK]   vkey:      ${vkey}`);
     console.log(`[ZK]   status:    ${verified === "true" ? "VALID — ready for settlement" : "INVALID — intent rejected"}`);
     divider();
+
+    // ── Trigger Solana settlement if verified ──
+    if (verified === "true") {
+      console.log(`[SETTLE] ZK verified — triggering Solana settlement...`);
+      const settler = spawn("node", [SETTLE_SCRIPT], { env: process.env });
+      let settleOut = "";
+      let settleErr = "";
+      settler.stdout.on("data", (d: Buffer) => { settleOut += d.toString(); });
+      settler.stderr.on("data", (d: Buffer) => { settleErr += d.toString(); });
+      settler.on("close", (code: number) => {
+        if (code !== 0) {
+          console.error(`[SETTLE] Settlement failed (code ${code})`);
+          if (settleErr) console.error(`[SETTLE] ${settleErr.trim()}`);
+          return;
+        }
+        const settleTxMatch = settleOut.match(/receive_settlement tx:\s*(\S+)/);
+        const deltaMatch = settleOut.match(/Delta:\s*\+\s*([\d.]+)/);
+        const settleTx = settleTxMatch ? settleTxMatch[1] : "unknown";
+        const delta = deltaMatch ? deltaMatch[1] : "unknown";
+        divider();
+        console.log(`[SETTLE] ─── SOLANA SETTLEMENT COMPLETE ───`);
+        console.log(`[SETTLE]   intentId:   ${intentId}`);
+        console.log(`[SETTLE]   settleTx:   ${settleTx}`);
+        console.log(`[SETTLE]   delivered:  ${delta} SOL`);
+        console.log(`[SETTLE]   destination: C9CZZFbeJ2Vzj9w8ctcsYKyK4mLQNq2vvsGwPJ7uEHtd`);
+        console.log(`[SETTLE]   note: 1:1 mock rate (devnet). Pyth oracle + Jupiter routing at mainnet.`);
+        divider();
+      });
+      settler.on("error", (err: Error) => {
+        console.error(`[SETTLE] Failed to spawn settler:`, err.message);
+      });
+    }
   });
 
   prover.on("error", (err: Error) => {

@@ -1,0 +1,955 @@
+{
+  "address": "9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv",
+  "metadata": {
+    "name": "maat",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Maat — ZK-verified cross-chain intent settlement"
+  },
+  "instructions": [
+    {
+      "name": "cancel_intent",
+      "discriminator": [
+        67,
+        73,
+        238,
+        244,
+        208,
+        89,
+        225,
+        59
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "intent",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  116,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "intent.owner",
+                "account": "Intent"
+              },
+              {
+                "kind": "account",
+                "path": "intent.nonce",
+                "account": "Intent"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize",
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "deployer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "orchestrator",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "pause",
+      "discriminator": [
+        211,
+        22,
+        221,
+        251,
+        74,
+        121,
+        193,
+        47
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "receive_settlement",
+      "discriminator": [
+        62,
+        228,
+        231,
+        129,
+        214,
+        108,
+        51,
+        116
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "intent",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  116,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "intent.owner",
+                "account": "Intent"
+              },
+              {
+                "kind": "account",
+                "path": "intent.nonce",
+                "account": "Intent"
+              }
+            ]
+          }
+        },
+        {
+          "name": "circuit_breaker",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  98
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "circuit_breaker.channel_id",
+                "account": "CircuitBreaker"
+              }
+            ]
+          }
+        },
+        {
+          "name": "orchestrator",
+          "signer": true
+        },
+        {
+          "name": "destination",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "zk_proof_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "settlement_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_circuit_breaker",
+      "discriminator": [
+        135,
+        207,
+        46,
+        31,
+        152,
+        94,
+        123,
+        247
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "circuit_breaker",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  98
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "channel_id"
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "channel_id",
+          "type": "u64"
+        },
+        {
+          "name": "halted",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "submit_intent",
+      "discriminator": [
+        159,
+        255,
+        153,
+        9,
+        149,
+        139,
+        73,
+        112
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "intent",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  116,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              },
+              {
+                "kind": "account",
+                "path": "program_state.intent_nonce",
+                "account": "ProgramState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "destination",
+          "type": "pubkey"
+        },
+        {
+          "name": "expiry",
+          "type": "i64"
+        },
+        {
+          "name": "slippage_bps",
+          "type": "u16"
+        },
+        {
+          "name": "source_chain_id",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "unpause",
+      "discriminator": [
+        169,
+        144,
+        4,
+        38,
+        10,
+        141,
+        188,
+        255
+      ],
+      "accounts": [
+        {
+          "name": "program_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "CircuitBreaker",
+      "discriminator": [
+        123,
+        141,
+        226,
+        182,
+        3,
+        205,
+        19,
+        253
+      ]
+    },
+    {
+      "name": "Intent",
+      "discriminator": [
+        247,
+        162,
+        35,
+        165,
+        254,
+        111,
+        129,
+        109
+      ]
+    },
+    {
+      "name": "ProgramState",
+      "discriminator": [
+        77,
+        209,
+        137,
+        229,
+        149,
+        67,
+        167,
+        230
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "CircuitBreakerUpdated",
+      "discriminator": [
+        97,
+        84,
+        68,
+        47,
+        152,
+        122,
+        132,
+        128
+      ]
+    },
+    {
+      "name": "IntentCancelled",
+      "discriminator": [
+        39,
+        174,
+        74,
+        165,
+        39,
+        101,
+        119,
+        29
+      ]
+    },
+    {
+      "name": "IntentSettled",
+      "discriminator": [
+        112,
+        202,
+        229,
+        173,
+        39,
+        129,
+        254,
+        38
+      ]
+    },
+    {
+      "name": "IntentSubmitted",
+      "discriminator": [
+        206,
+        100,
+        231,
+        141,
+        245,
+        30,
+        80,
+        99
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "ProgramPaused",
+      "msg": "Program is paused"
+    },
+    {
+      "code": 6001,
+      "name": "NotOrchestrator",
+      "msg": "Signer is not the orchestrator"
+    },
+    {
+      "code": 6002,
+      "name": "NotAdmin",
+      "msg": "Signer is not the admin"
+    },
+    {
+      "code": 6003,
+      "name": "IntentNotPending",
+      "msg": "Intent is not in Pending status"
+    },
+    {
+      "code": 6004,
+      "name": "IntentExpired",
+      "msg": "Intent has expired"
+    },
+    {
+      "code": 6005,
+      "name": "ChannelHalted",
+      "msg": "Channel is halted by circuit breaker"
+    },
+    {
+      "code": 6006,
+      "name": "ChannelMismatch",
+      "msg": "Circuit breaker channel does not match intent source chain"
+    },
+    {
+      "code": 6007,
+      "name": "AccountSubstitution",
+      "msg": "Destination account does not match intent"
+    },
+    {
+      "code": 6008,
+      "name": "InsufficientFunds",
+      "msg": "Insufficient funds in intent account"
+    },
+    {
+      "code": 6009,
+      "name": "Overflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6010,
+      "name": "NotIntentOwner",
+      "msg": "Signer is not the intent owner"
+    },
+    {
+      "code": 6011,
+      "name": "IntentNotCancellable",
+      "msg": "Intent is not yet cancellable (not expired and program not paused)"
+    },
+    {
+      "code": 6012,
+      "name": "SlippageExceeded",
+      "msg": "Settlement amount is below the slippage floor"
+    },
+    {
+      "code": 6013,
+      "name": "SettlementExceedsEscrow",
+      "msg": "Settlement amount exceeds the intent's escrowed amount"
+    },
+    {
+      "code": 6014,
+      "name": "Unauthorized",
+      "msg": "Unauthorized: owner account does not match intent owner"
+    }
+  ],
+  "types": [
+    {
+      "name": "CircuitBreaker",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "channel_id",
+            "type": "u64"
+          },
+          {
+            "name": "halted",
+            "type": "bool"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CircuitBreakerUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "channel_id",
+            "type": "u64"
+          },
+          {
+            "name": "halted",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Intent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "destination",
+            "type": "pubkey"
+          },
+          {
+            "name": "expiry",
+            "type": "i64"
+          },
+          {
+            "name": "slippage_bps",
+            "type": "u16"
+          },
+          {
+            "name": "source_chain_id",
+            "type": "u64"
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "IntentStatus"
+              }
+            }
+          },
+          {
+            "name": "zk_proof_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "settled_at",
+            "type": "i64"
+          },
+          {
+            "name": "settled_amount",
+            "type": "u64"
+          },
+          {
+            "name": "nonce",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IntentCancelled",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "intent",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IntentSettled",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "intent_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "destination",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "zk_proof_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "settled_at",
+            "type": "i64"
+          },
+          {
+            "name": "refund_amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IntentStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Pending"
+          },
+          {
+            "name": "Settled"
+          },
+          {
+            "name": "Expired"
+          },
+          {
+            "name": "Slashed"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IntentSubmitted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "intent_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "destination",
+            "type": "pubkey"
+          },
+          {
+            "name": "expiry",
+            "type": "i64"
+          },
+          {
+            "name": "source_chain_id",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProgramState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "orchestrator",
+            "type": "pubkey"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "intent_nonce",
+            "type": "u64"
+          }
+        ]
+      }
+    }
+  ]
+}
