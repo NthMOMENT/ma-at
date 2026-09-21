@@ -1,6 +1,8 @@
 import { createPublicClient, http, fallback, parseAbiItem, type Log, type Chain } from "viem";
 import { arbitrumSepolia } from "viem/chains";
 import * as dotenv from "dotenv";
+import { spawn } from "child_process";
+import * as path from "path";
 
 dotenv.config();
 
@@ -11,6 +13,9 @@ const INTENT_MANAGER_ADDRESS = "0xab8682775cf43059BCEed90975D8ee8Ac152D505" as c
 const ALCHEMY_RPC_URL_1 = process.env.ALCHEMY_RPC_URL_1;
 const ALCHEMY_RPC_URL_2 = process.env.ALCHEMY_RPC_URL_2;
 const ROBINHOOD_RPC_URL = process.env.ROBINHOOD_RPC_URL ?? "https://rpc.testnet.chain.robinhood.com";
+
+// Path to the compiled SP1 prover binary
+const PROVER_BINARY = process.env.PROVER_BINARY_PATH ?? path.resolve(__dirname, "../../zk/target/release/prove");
 
 if (!ALCHEMY_RPC_URL_1 || !ALCHEMY_RPC_URL_2) {
   console.error("[FATAL] ALCHEMY_RPC_URL_1 and ALCHEMY_RPC_URL_2 must both be set in .env");
@@ -45,8 +50,6 @@ const INTENT_SETTLED_EVENT = parseAbiItem(
 const INTENT_MANAGER_ABI = [INTENT_CREATED_EVENT, COLLATERAL_POSTED_EVENT, INTENT_SETTLED_EVENT] as const;
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
-// Arbitrum Sepolia uses viem's fallback() transport across two Alchemy URLs
-// so a single provider's rate limit doesn't take the listener down.
 
 const arbClient = createPublicClient({
   chain: arbitrumSepolia,
@@ -68,8 +71,68 @@ function divider(): void {
   console.log("─".repeat(64));
 }
 
+// ─── ZK Proof Trigger ────────────────────────────────────────────────────────
+// Spawns the SP1 prover binary in execute mode (instant, no GPU needed).
+// Parses stdout for verified status and cycle count.
+// Called automatically on every IntentCreated event.
+
+function triggerZKVerification(intentId: string, blockNumber: string): void {
+  console.log(`[ZK] Spawning prover for intentId: ${intentId}`);
+  console.log(`[ZK] Binary: ${PROVER_BINARY}`);
+  console.log(`[ZK] Mode: execute (instant verification)`);
+
+  const env = {
+    ...process.env,
+    SP1_PROVER: "cpu",
+  };
+
+  const prover = spawn(PROVER_BINARY, ["execute"], { env });
+
+  let stdout = "";
+  let stderr = "";
+
+  prover.stdout.on("data", (data: Buffer) => {
+    stdout += data.toString();
+  });
+
+  prover.stderr.on("data", (data: Buffer) => {
+    stderr += data.toString();
+  });
+
+  prover.on("close", (code: number) => {
+    if (code !== 0) {
+      console.error(`[ZK] Prover exited with code ${code}`);
+      if (stderr) console.error(`[ZK] stderr: ${stderr.trim()}`);
+      return;
+    }
+
+    // Parse verified status
+    const verifiedMatch = stdout.match(/verified:\s*(true|false)/);
+    const cyclesMatch = stdout.match(/cycles:\s*(\d+)/);
+    const vkeyMatch = stdout.match(/Verification key:\s*(0x[a-fA-F0-9]+)/);
+
+    const verified = verifiedMatch ? verifiedMatch[1] : "unknown";
+    const cycles = cyclesMatch ? cyclesMatch[1] : "unknown";
+    const vkey = vkeyMatch ? vkeyMatch[1] : "unknown";
+
+    divider();
+    console.log(`[ZK] ─── PROOF VERIFICATION COMPLETE ───`);
+    console.log(`[ZK]   intentId:  ${intentId}`);
+    console.log(`[ZK]   blockNum:  ${blockNumber}`);
+    console.log(`[ZK]   verified:  ${verified}`);
+    console.log(`[ZK]   cycles:    ${cycles}`);
+    console.log(`[ZK]   vkey:      ${vkey}`);
+    console.log(`[ZK]   status:    ${verified === "true" ? "VALID — ready for settlement" : "INVALID — intent rejected"}`);
+    divider();
+  });
+
+  prover.on("error", (err: Error) => {
+    console.error(`[ZK] Failed to spawn prover:`, err.message);
+    console.error(`[ZK] Is the binary at ${PROVER_BINARY}?`);
+  });
+}
+
 // ─── Event handlers ────────────────────────────────────────────────────────────
-// Each handler is wrapped so a single malformed log can never crash the process.
 
 function logIntentCreated(log: Log, chainLabel: string): void {
   try {
@@ -99,6 +162,11 @@ function logIntentCreated(log: Log, chainLabel: string): void {
     console.log(`  txHash:             ${log.transactionHash}`);
     console.log(`  blockNumber:        ${log.blockNumber?.toString()}`);
     divider();
+
+    // ── Automatically trigger ZK verification ──
+    console.log(`[ZK] IntentCreated detected — triggering ZK verification...`);
+    triggerZKVerification(args.intentId, log.blockNumber?.toString() ?? "unknown");
+
   } catch (err) {
     console.error(`[ERROR] Failed to process IntentCreated log on ${chainLabel}:`, err);
   }
@@ -186,20 +254,19 @@ function watchChain(client: typeof arbClient | typeof rhClient, chainLabel: stri
 
 async function main(): Promise<void> {
   console.log("═".repeat(64));
-  console.log("  Maat Orchestrator — Intent Listener");
+  console.log("  Maat Orchestrator — Intent Listener + ZK Verifier");
   console.log(`  Started: ${new Date().toISOString()}`);
+  console.log(`  Prover:  ${PROVER_BINARY}`);
   console.log("═".repeat(64) + "\n");
 
-  // Arbitrum Sepolia is required — exit if unreachable on both Alchemy URLs.
   try {
     const arbBlock = await arbClient.getBlockNumber();
     console.log(`[Arbitrum Sepolia] Connected. Latest block: ${arbBlock}`);
   } catch (err) {
-    console.error("[FATAL] Cannot connect to Arbitrum Sepolia RPC (both Alchemy URLs failed):", (err as Error).message);
+    console.error("[FATAL] Cannot connect to Arbitrum Sepolia RPC:", (err as Error).message);
     process.exit(1);
   }
 
-  // Robinhood Chain Testnet is best-effort — warn and continue if unreachable.
   let robinhoodAvailable = true;
   try {
     const rhBlock = await rhClient.getBlockNumber();
