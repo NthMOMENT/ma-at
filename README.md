@@ -82,6 +82,12 @@ Audit: **30/30 exploit checks 0 findings** including live reentrancy attack ([gl
 |---|---|
 | Solana Devnet | `9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv` |
 
+### Tron
+
+| Network | Program ID |
+|---|---|
+| Tron Testnet | TG3hViVvZ8RZc6GuZGiJq3rDRs2tuWXSvL |
+
 ---
 
 ## Security Model
