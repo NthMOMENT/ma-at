@@ -73,8 +73,8 @@ Audit: **30/30 exploit checks 0 findings** including live reentrancy attack ([gl
 
 | Network | Address | Explorer |
 |---|---|---|
-| Arbitrum Sepolia | `0xab8682775cf43059BCEed90975D8ee8Ac152D505` | [Arbiscan](https://sepolia.arbiscan.io/address/0xab8682775cf43059bceed90975d8ee8ac152d505) |
-| Robinhood Chain Testnet | `0xab8682775cf43059BCEed90975D8ee8Ac152D505` | [Explorer](https://explorer.testnet.chain.robinhood.com/address/0xab8682775cf43059bceed90975d8ee8ac152d505) |
+| Arbitrum Sepolia | `0xc439850734f7f3fa13294c3001cfb9e5e737490f` | [Arbiscan](https://sepolia.arbiscan.io/address/0xab8682775cf43059bceed90975d8ee8ac152d505) |
+| Robinhood Chain Testnet | `0xcd8502321fb983b9c69406c531768785ccf2c93d` | [Explorer](https://explorer.testnet.chain.robinhood.com/address/0xab8682775cf43059bceed90975d8ee8ac152d505) |
 
 ### Solana
 
