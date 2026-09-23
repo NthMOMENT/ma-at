@@ -23,7 +23,7 @@ Maat is a decentralized, ZK verified cross chain intent network. Sign one transa
 ## Repo Structure
 
 ```
-/frontend               → Next.js UI (Week 3)
+/frontend               → Next.js UI (live at ma-at.xyz)
 /orchestrator           → Intent listener + orchestration chain
 /orchestrator/cas-chain → Cosmos SDK app chain
 /contracts/evm          → IntentManager.sol (Arbitrum Sepolia + Robinhood Chain)
@@ -73,8 +73,8 @@ Audit: **30/30 exploit checks 0 findings** including live reentrancy attack ([gl
 
 | Network | Address | Explorer |
 |---|---|---|
-| Arbitrum Sepolia | `0xc439850734f7f3fa13294c3001cfb9e5e737490f` | [Arbiscan](https://sepolia.arbiscan.io/address/0xab8682775cf43059bceed90975d8ee8ac152d505) |
-| Robinhood Chain Testnet | `0xcd8502321fb983b9c69406c531768785ccf2c93d` | [Explorer](https://explorer.testnet.chain.robinhood.com/address/0xab8682775cf43059bceed90975d8ee8ac152d505) |
+| Arbitrum Sepolia | `0x9D1bd7119E9FefF6Baa3968272811323B354B16f` | [Arbiscan](https://sepolia.arbiscan.io/address/0x9D1bd7119E9FefF6Baa3968272811323B354B16f) |
+| Robinhood Chain Testnet | `0xcA6bf2D574209D49515a9Eeb61E27924edE28860` | [Explorer](https://explorer.testnet.chain.robinhood.com/address/0xcA6bf2D574209D49515a9Eeb61E27924edE28860) |
 
 ### Solana
 
@@ -82,14 +82,13 @@ Audit: **30/30 exploit checks 0 findings** including live reentrancy attack ([gl
 |---|---|
 | Solana Devnet | `9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv` |
 
-### Tron
+### TRON
 
-| Network | Program ID |
-|---|---|
-| Tron Testnet | TBxLkBxy4sFnztxKnYbTGHd47oTf4GxLNi |
+| Network | Address | Explorer |
+|---|---|---|
+| TRON Nile Testnet | `TW1PqkjksxFUefywyYYNHS4P2jeQaXzJWe` | [Tronscan](https://nile.tronscan.org/#/contract/TW1PqkjksxFUefywyYYNHS4P2jeQaXzJWe) |
 
 ---
-
 ## Security Model
 
 - **Solver Credit Scoring** — collateral, success rate, and latency determine routing tier
