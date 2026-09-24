@@ -7,8 +7,28 @@ const HOT_WALLET_PATH = process.env.HOME + '/.config/solana/hot-wallet.json';
 const PROGRAM_ID = new PublicKey('9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv');
 const IDL_PATH = path.join(__dirname, 'maat_idl.json');
 
-// Treasury wallet — receives the settlement
-const TREASURY = new PublicKey('C9CZZFbeJ2Vzj9w8ctcsYKyK4mLQNq2vvsGwPJ7uEHtd');
+// Settlement destination — decoded by the orchestrator listener from the
+// EVM/TRON IntentCreated event's destinationWallet and passed in via env.
+// Falls back to the treasury wallet only when run standalone (e.g. manual testing).
+const DESTINATION_CHAIN_ID = process.env.DESTINATION_CHAIN_ID || '1399811149';
+const DESTINATION_WALLET = process.env.DESTINATION_WALLET
+  || 'C9CZZFbeJ2Vzj9w8ctcsYKyK4mLQNq2vvsGwPJ7uEHtd';
+
+const SOLANA_CHAIN_ID = '1399811149';
+
+// This settlement script only knows how to deliver SOL on Solana. The
+// listener also fires it for EVM/TRON-destined intents (its job stops at ZK
+// verification), so route those out here rather than letting them fail deep
+// inside the Solana PublicKey/Anchor calls below.
+if (DESTINATION_CHAIN_ID !== SOLANA_CHAIN_ID) {
+  console.log('[SETTLE] Non-Solana destination detected.');
+  console.log('[SETTLE] Cross-chain settlement to EVM/TRON not yet implemented.');
+  console.log('[SETTLE] Destination:', DESTINATION_WALLET);
+  console.log('[SETTLE] Chain:', DESTINATION_CHAIN_ID);
+  process.exit(0);
+}
+
+const DESTINATION = new PublicKey(DESTINATION_WALLET);
 
 // Settlement amount: 0.005 SOL in lamports (matches EVM intent amount)
 const SETTLEMENT_AMOUNT = new anchor.BN(5_000_000);
@@ -27,7 +47,10 @@ async function main() {
   const hotWallet = Keypair.fromSecretKey(Uint8Array.from(keypairData));
   console.log('Hot wallet (solver):', hotWallet.publicKey.toBase58());
 
-  const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+  const connection = new Connection(
+    process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com',
+    'confirmed'
+  );
   const wallet = new anchor.Wallet(hotWallet);
   const provider = new anchor.AnchorProvider(connection, wallet, { commitment: 'confirmed' });
   anchor.setProvider(provider);
@@ -65,9 +88,9 @@ async function main() {
   );
   console.log('Circuit breaker PDA:', circuitBreakerPda.toBase58());
 
-  // Check treasury balance before
-  const balanceBefore = await connection.getBalance(TREASURY);
-  console.log('\nTreasury balance before:', balanceBefore / 1e9, 'SOL');
+  // Check destination balance before
+  const balanceBefore = await connection.getBalance(DESTINATION);
+  console.log('\nDestination balance before:', balanceBefore / 1e9, 'SOL');
 
   // Step 1: submit_intent — escrow SOL into the intent PDA
   console.log('\n[Step 1] Submitting intent on Solana (escrowing', SETTLEMENT_AMOUNT.toString(), 'lamports)...');
@@ -76,7 +99,7 @@ async function main() {
   const submitTx = await program.methods
     .submitIntent(
       SETTLEMENT_AMOUNT,
-      TREASURY,
+      DESTINATION,
       expiry,
       50,
       SOURCE_CHAIN_ID
@@ -116,20 +139,20 @@ async function main() {
       intent: settledIntentPda,
       circuitBreaker: circuitBreakerPda,
       orchestrator: hotWallet.publicKey,
-      destination: TREASURY,
+      destination: DESTINATION,
       owner: hotWallet.publicKey,
     })
     .rpc();
 
   console.log('receive_settlement tx:', settleTx);
 
-  // Check treasury balance after
-  const balanceAfter = await connection.getBalance(TREASURY);
-  console.log('\nTreasury balance after: ', balanceAfter / 1e9, 'SOL');
+  // Check destination balance after
+  const balanceAfter = await connection.getBalance(DESTINATION);
+  console.log('\nDestination balance after: ', balanceAfter / 1e9, 'SOL');
   console.log('Delta:                  +', (balanceAfter - balanceBefore) / 1e9, 'SOL');
   console.log('\n✓ FULL CIRCLE COMPLETE');
   console.log('  EVM intent → ZK verified → Solana settlement → funds delivered');
-  console.log('  Destination:', TREASURY.toBase58());
+  console.log('  Destination:', DESTINATION.toBase58());
   console.log('  Settlement tx:', settleTx);
 }
 

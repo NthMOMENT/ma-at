@@ -3,12 +3,19 @@ import { arbitrumSepolia } from "viem/chains";
 import * as dotenv from "dotenv";
 import { spawn } from "child_process";
 import * as path from "path";
+import { createHash } from "crypto";
+import { PublicKey } from "@solana/web3.js";
 
 dotenv.config();
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const INTENT_MANAGER_ADDRESS = "0xab8682775cf43059BCEed90975D8ee8Ac152D505" as const;
+// Each chain has its own IntentManager deployment — never share one address
+// across chains here, since the two are deployed independently.
+const ARBITRUM_INTENT_MANAGER_ADDRESS = (process.env.ARBITRUM_INTENT_MANAGER_ADDRESS ??
+  "0x9D1bd7119E9FefF6Baa3968272811323B354B16f") as `0x${string}`;
+const ROBINHOOD_INTENT_MANAGER_ADDRESS = (process.env.ROBINHOOD_INTENT_MANAGER_ADDRESS ??
+  "0xcA6bf2D574209D49515a9Eeb61E27924edE28860") as `0x${string}`;
 
 const ALCHEMY_RPC_URL_1 = process.env.ALCHEMY_RPC_URL_1;
 const ALCHEMY_RPC_URL_2 = process.env.ALCHEMY_RPC_URL_2;
@@ -37,8 +44,57 @@ const robinhoodTestnet: Chain = {
 // ─── ABI ─────────────────────────────────────────────────────────────────────
 
 const INTENT_CREATED_EVENT = parseAbiItem(
-  "event IntentCreated(bytes32 indexed intentId, address indexed sender, uint256 amount, address destinationWallet, uint64 destinationChainId, uint64 expiry, uint16 slippageBps)"
+  "event IntentCreated(bytes32 indexed intentId, address indexed sender, uint256 amount, address tokenAddress, bytes32 destinationWallet, uint64 destinationChainId, uint64 expiry, uint16 slippageBps)"
 );
+
+// Chain IDs that use a non-EVM VM — destinationWallet is decoded differently for these.
+const SOLANA_CHAIN_ID = 1399811149n;
+// Matches ma-at-web/lib/chains.ts's onChainId for TRON Nile — the value the
+// frontend actually submits as destinationChainId, not the value named in
+// the original TRON-support task spec (2494104990), which doesn't match.
+const TRON_NILE_CHAIN_ID = 3448148188n;
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58CheckEncode(hex: string): string {
+  const buf = Buffer.from(hex, "hex");
+  const checksum = createHash("sha256").update(createHash("sha256").update(buf).digest()).digest().subarray(0, 4);
+  const bytes = Buffer.concat([buf, checksum]);
+
+  let value = BigInt("0x" + bytes.toString("hex"));
+  let result = "";
+  while (value > 0n) {
+    const mod = value % 58n;
+    result = BASE58_ALPHABET[Number(mod)] + result;
+    value /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte === 0) result = "1" + result;
+    else break;
+  }
+  return result;
+}
+
+/// Decodes an IntentCreated `destinationWallet` (bytes32) per the encoding
+/// convention documented on IntentManager.sol's Intent struct:
+///   - Solana: the raw 32-byte public key.
+///   - TRON: the raw 21-byte address (1-byte prefix + 20 address bytes),
+///     right-padded with zeros — checksum is recomputed on encode.
+///   - EVM (anything else): left-padded address, in the low 20 bytes.
+function decodeDestinationWallet(destinationWallet: `0x${string}`, destinationChainId: bigint): string {
+  const bytes = Buffer.from(destinationWallet.slice(2), "hex");
+
+  if (destinationChainId === SOLANA_CHAIN_ID) {
+    return new PublicKey(bytes).toBase58();
+  }
+
+  if (destinationChainId === TRON_NILE_CHAIN_ID) {
+    const payload = bytes.subarray(0, 21);
+    return base58CheckEncode(payload.toString("hex"));
+  }
+
+  return `0x${bytes.subarray(12).toString("hex")}`;
+}
 
 const COLLATERAL_POSTED_EVENT = parseAbiItem(
   "event CollateralPosted(bytes32 indexed intentId, address indexed solver, uint256 collateralAmount)"
@@ -77,7 +133,12 @@ function divider(): void {
 // Parses stdout for verified status and cycle count.
 // Called automatically on every IntentCreated event.
 
-function triggerZKVerification(intentId: string, blockNumber: string): void {
+function triggerZKVerification(
+  intentId: string,
+  blockNumber: string,
+  destinationWallet: string,
+  destinationChainId: bigint
+): void {
   console.log(`[ZK] Spawning prover for intentId: ${intentId}`);
   console.log(`[ZK] Binary: ${PROVER_BINARY}`);
   console.log(`[ZK] Mode: execute (instant verification)`);
@@ -129,7 +190,12 @@ function triggerZKVerification(intentId: string, blockNumber: string): void {
     // ── Trigger Solana settlement if verified ──
     if (verified === "true") {
       console.log(`[SETTLE] ZK verified — triggering Solana settlement...`);
-      const settler = spawn("node", [SETTLE_SCRIPT], { env: process.env });
+      const settleEnv = {
+        ...process.env,
+        DESTINATION_WALLET: destinationWallet,
+        DESTINATION_CHAIN_ID: destinationChainId.toString(),
+      };
+      const settler = spawn("node", [SETTLE_SCRIPT], { env: settleEnv });
       let settleOut = "";
       let settleErr = "";
       settler.stdout.on("data", (d: Buffer) => { settleOut += d.toString(); });
@@ -174,6 +240,7 @@ function logIntentCreated(log: Log, chainLabel: string): void {
         intentId: `0x${string}`;
         sender: `0x${string}`;
         amount: bigint;
+        tokenAddress: `0x${string}`;
         destinationWallet: `0x${string}`;
         destinationChainId: bigint;
         expiry: bigint;
@@ -182,13 +249,16 @@ function logIntentCreated(log: Log, chainLabel: string): void {
     }).args;
 
     const expiryDate = new Date(Number(args.expiry) * 1000).toISOString();
+    const isNative = args.tokenAddress === "0x0000000000000000000000000000000000000000";
 
     divider();
     console.log(`[IntentCreated] Chain: ${chainLabel}`);
     console.log(`  intentId:           ${args.intentId}`);
     console.log(`  sender:             ${args.sender}`);
     console.log(`  amount:             ${formatEther(args.amount)} ETH (${args.amount.toString()} wei)`);
-    console.log(`  destinationWallet:  ${args.destinationWallet}`);
+    console.log(`  tokenAddress:       ${args.tokenAddress}${isNative ? " (native)" : " (ERC20)"}`);
+    const decodedDestination = decodeDestinationWallet(args.destinationWallet, args.destinationChainId);
+    console.log(`  destinationWallet:  ${args.destinationWallet} (decoded: ${decodedDestination})`);
     console.log(`  destinationChainId: ${args.destinationChainId.toString()}`);
     console.log(`  expiry:             ${expiryDate} (${args.expiry.toString()})`);
     console.log(`  slippageBps:        ${args.slippageBps} (${(args.slippageBps / 100).toFixed(2)}%)`);
@@ -198,7 +268,12 @@ function logIntentCreated(log: Log, chainLabel: string): void {
 
     // ── Automatically trigger ZK verification ──
     console.log(`[ZK] IntentCreated detected — triggering ZK verification...`);
-    triggerZKVerification(args.intentId, log.blockNumber?.toString() ?? "unknown");
+    triggerZKVerification(
+      args.intentId,
+      log.blockNumber?.toString() ?? "unknown",
+      decodedDestination,
+      args.destinationChainId
+    );
 
   } catch (err) {
     console.error(`[ERROR] Failed to process IntentCreated log on ${chainLabel}:`, err);
@@ -255,11 +330,15 @@ function logIntentSettled(log: Log, chainLabel: string): void {
 
 // ─── Watchers ────────────────────────────────────────────────────────────────
 
-function watchChain(client: typeof arbClient | typeof rhClient, chainLabel: string): void {
-  console.log(`[${chainLabel}] Watching IntentManager at ${INTENT_MANAGER_ADDRESS}`);
+function watchChain(
+  client: typeof arbClient | typeof rhClient,
+  chainLabel: string,
+  intentManagerAddress: `0x${string}`
+): void {
+  console.log(`[${chainLabel}] Watching IntentManager at ${intentManagerAddress}`);
 
   client.watchContractEvent({
-    address: INTENT_MANAGER_ADDRESS,
+    address: intentManagerAddress,
     abi: INTENT_MANAGER_ABI,
     eventName: "IntentCreated",
     onLogs: (logs) => logs.forEach((log) => logIntentCreated(log, chainLabel)),
@@ -267,7 +346,7 @@ function watchChain(client: typeof arbClient | typeof rhClient, chainLabel: stri
   });
 
   client.watchContractEvent({
-    address: INTENT_MANAGER_ADDRESS,
+    address: intentManagerAddress,
     abi: INTENT_MANAGER_ABI,
     eventName: "CollateralPosted",
     onLogs: (logs) => logs.forEach((log) => logCollateralPosted(log, chainLabel)),
@@ -275,7 +354,7 @@ function watchChain(client: typeof arbClient | typeof rhClient, chainLabel: stri
   });
 
   client.watchContractEvent({
-    address: INTENT_MANAGER_ADDRESS,
+    address: intentManagerAddress,
     abi: INTENT_MANAGER_ABI,
     eventName: "IntentSettled",
     onLogs: (logs) => logs.forEach((log) => logIntentSettled(log, chainLabel)),
@@ -311,9 +390,9 @@ async function main(): Promise<void> {
   }
 
   console.log("");
-  watchChain(arbClient, "Arbitrum Sepolia");
+  watchChain(arbClient, "Arbitrum Sepolia", ARBITRUM_INTENT_MANAGER_ADDRESS);
   if (robinhoodAvailable) {
-    watchChain(rhClient, "Robinhood Testnet");
+    watchChain(rhClient, "Robinhood Testnet", ROBINHOOD_INTENT_MANAGER_ADDRESS);
   }
 
   console.log("\n[Orchestrator] Listening. Waiting for intents...\n");

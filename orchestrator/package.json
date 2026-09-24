@@ -6,16 +6,22 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/listener.js",
-    "dev": "ts-node src/listener.ts"
+    "dev": "ts-node src/listener.ts",
+    "start:tron": "node dist/tron_listener.js",
+    "dev:tron": "ts-node src/tron_listener.ts",
+    "deploy:tron": "node deploy_tron.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.0",
+    "@openzeppelin/contracts": "^5.1.0",
     "@solana/web3.js": "^1.99.0",
     "dotenv": "^16.4.5",
+    "tronweb": "^6.5.1",
     "viem": "^2.15.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
+    "solc": "^0.8.24",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
   }
