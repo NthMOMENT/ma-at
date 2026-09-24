@@ -4,3 +4,11 @@ members = [
     "script",
 ]
 resolver = "2"
+
+# Routes the program's keccak256 calls (tiny-keccak) through SP1's keccak
+# precompile instead of naive RISC-V execution. Only affects the `program`
+# crate (script/header_check.rs uses the plain `sha3` crate on the host side,
+# where there's no precompile to route through). Does not touch sp1-sdk/
+# sp1-zkvm's own pinned version in Cargo.lock.
+[patch.crates-io]
+tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-6.0.0" }

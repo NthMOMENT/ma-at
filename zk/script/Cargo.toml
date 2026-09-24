@@ -7,6 +7,10 @@ edition = "2021"
 name = "prove"
 path = "src/bin/prove.rs"
 
+[[bin]]
+name = "header_check"
+path = "src/bin/header_check.rs"
+
 [dependencies]
 sp1-sdk = { version = "6.0.1" }
 serde = { version = "1.0", features = ["derive"] }
@@ -16,6 +20,10 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 hex = "0.4"
 anyhow = "1.0"
 dotenv = "0.15"
+rlp = "0.6"
+sha3 = "0.10"
+eth_trie = "0.6"
+alloy-primitives = "1.0"
 
 [build-dependencies]
 sp1-build = { version = "6.0.1" }

@@ -5,3 +5,10 @@ orchestrator/check_program.js
 orchestrator/check_state.js
 orchestrator/init_program.js
 contracts/solana/maat/target/
+contracts/evm/.env
+contracts/evm/lib/
+contracts/evm/broadcast/
+contracts/evm/cache/
+contracts/evm/out/
+zk/proof_output.bin
+zk/prove_output.log
