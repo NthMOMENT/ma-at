@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sp1_sdk::{include_elf, Elf, HashableKey, Prover, ProveRequest, ProverClient, ProvingKey, SP1Stdin};
 use std::env;
+use std::fmt;
 use std::sync::Arc;
 
 const TARGET_CONTRACT: &str = "0x9D1bd7119E9FefF6Baa3968272811323B354B16f";
@@ -21,6 +22,13 @@ const TARGET_CONTRACT: &str = "0x9D1bd7119E9FefF6Baa3968272811323B354B16f";
 // --tamper=different-contract negative test.
 const OTHER_REAL_CONTRACT: &str = "0xcA6bf2D574209D49515a9Eeb61E27924edE28860";
 const INTENT_CREATED_TOPIC0: &str = "0x1633e7e54ae0b855365938679d6532826f20b065ed71f076c885b24249decd99";
+// Solana chain id this deployment settles to. NOT enforced inside the zkVM
+// (doing so would change the ELF and therefore the vkey) — the zkVM commits
+// the real destinationChainId trustlessly regardless, and the orchestrator's
+// settle gate (Phase 5B) re-checks it against that committed public output.
+// This native check exists only to fail fast/readably instead of burning a
+// ~7min/14GB prove run on an intent that was never going to settle here.
+const EXPECTED_DESTINATION_CHAIN_ID: u64 = 1_399_811_149;
 
 const MAAT_ZK_ELF: Elf = include_elf!("maat-zk-program");
 
@@ -49,6 +57,106 @@ pub struct ProofOutput {
     pub slippage_bps: u16,
 }
 
+/// Everything written to proof_<intentId>.json — the full set of public
+/// outputs plus the run metadata needed to make sense of them without
+/// re-reading the binary proof.
+#[derive(Serialize)]
+struct ProofOutputJson {
+    tx_hash: String,
+    mode: String,
+    vkey: String,
+    block_hash: String,
+    block_number: u64,
+    block_timestamp: u64,
+    contract: String,
+    intent_id: String,
+    sender: String,
+    amount: String,
+    token_address: String,
+    destination_wallet: String,
+    destination_chain_id: u64,
+    expiry: u64,
+    slippage_bps: u16,
+}
+
+impl ProofOutputJson {
+    fn from_output(o: &ProofOutput, tx_hash: &str, mode: &str, vkey: &str) -> Self {
+        Self {
+            tx_hash: tx_hash.to_string(),
+            mode: mode.to_string(),
+            vkey: vkey.to_string(),
+            block_hash: format!("0x{}", hex::encode(o.block_hash)),
+            block_number: o.block_number,
+            block_timestamp: o.block_timestamp,
+            contract: format!("0x{}", hex::encode(o.contract)),
+            intent_id: format!("0x{}", hex::encode(o.intent_id)),
+            sender: format!("0x{}", hex::encode(o.sender)),
+            amount: format!("0x{}", hex::encode(o.amount)),
+            token_address: format!("0x{}", hex::encode(o.token_address)),
+            destination_wallet: format!("0x{}", hex::encode(o.destination_wallet)),
+            destination_chain_id: o.destination_chain_id,
+            expiry: o.expiry,
+            slippage_bps: o.slippage_bps,
+        }
+    }
+}
+
+/// Writes proof_<intentId>.json (mode == "prove") or exec_<intentId>.json
+/// (mode == "execute") to a temp name, then renames it into place. Called
+/// only on a clean, non-tampered outcome (a successful verify in prove mode;
+/// a successful, non-panicking run in execute mode), so a reader polling for
+/// the file never observes a partial write.
+///
+/// The prefix split matters downstream: the orchestrator (Phase 5B) will
+/// only ever settle off a proof_<id>.json whose "mode" field is "prove" and
+/// which has a matching proof_<id>.bin — an exec_<id>.json is execute-mode
+/// output (no cryptographic proof behind it, no .bin) and must never be
+/// mistaken for one.
+fn write_json_output(output: &ProofOutput, tx_hash: &str, mode: &str, vkey: &str) -> Result<()> {
+    let intent_id_hex = hex::encode(output.intent_id);
+    let prefix = if mode == "prove" { "proof" } else { "exec" };
+    let json_path = format!("{prefix}_{intent_id_hex}.json");
+    let json_tmp = format!("{json_path}.tmp");
+    let json = ProofOutputJson::from_output(output, tx_hash, mode, vkey);
+    std::fs::write(&json_tmp, serde_json::to_string_pretty(&json)?)?;
+    std::fs::rename(&json_tmp, &json_path)?;
+    println!("[maat-zk] Wrote {json_path}");
+    Ok(())
+}
+
+/// Distinguishes what the orchestrator needs to decide retry-vs-reject:
+/// Infra (RPC/proof-construction trouble, transient by nature) -> exit 1,
+/// retry with backoff. Semantic (the intent itself is bad) -> exit 2, mark
+/// Rejected, never retry.
+#[derive(Debug)]
+enum CheckError {
+    Infra(String),
+    Semantic(String),
+}
+
+impl CheckError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            CheckError::Infra(_) => 1,
+            CheckError::Semantic(_) => 2,
+        }
+    }
+    fn kind(&self) -> &'static str {
+        match self {
+            CheckError::Infra(_) => "infra",
+            CheckError::Semantic(_) => "semantic",
+        }
+    }
+}
+
+impl fmt::Display for CheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CheckError::Infra(m) | CheckError::Semantic(m) => write!(f, "{m}"),
+        }
+    }
+}
+
 fn h2b(s: &str) -> Result<Vec<u8>> {
     let s = s.trim_start_matches("0x");
     let s = if s.len() % 2 == 1 { format!("0{s}") } else { s.to_string() };
@@ -65,6 +173,17 @@ fn strip_leading_zeros(mut b: Vec<u8>) -> Vec<u8> {
         b.remove(0);
     }
     b
+}
+
+fn be_bytes_to_u64(b: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = b.len().min(8);
+    buf[8 - n..].copy_from_slice(&b[b.len() - n..]);
+    u64::from_be_bytes(buf)
+}
+
+fn hex_to_u64(s: &str) -> Result<u64, CheckError> {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| CheckError::Infra(format!("bad hex integer {s}: {e}")))
 }
 
 fn rpc_urls() -> Result<Vec<String>> {
@@ -181,67 +300,153 @@ fn encode_receipt(receipt: &Value) -> Result<Vec<u8>> {
     }
 }
 
-/// Fetches everything needed for one tx and assembles the real, untampered
-/// ProofInput — the single source of truth both normal runs and negative
-/// tests start from.
-fn build_real_input(urls: &[String], tx_hash: &str) -> Result<ProofInput> {
-    let tx = rpc_call(urls, "eth_getTransactionByHash", serde_json::json!([tx_hash]))?;
-    let to = tx["to"].as_str().unwrap_or("").to_lowercase();
-    if to != TARGET_CONTRACT.to_lowercase() {
-        return Err(anyhow!("tx.to ({to}) != target contract ({TARGET_CONTRACT})"));
+/// Fetches everything needed for one tx and runs, natively and with
+/// readable messages, every check the zkVM program would otherwise only
+/// surface as an opaque panic (status, contract, topic0, expiry) plus one
+/// it doesn't check at all (destination chain — see
+/// EXPECTED_DESTINATION_CHAIN_ID). Returns a ready-to-prove ProofInput.
+///
+/// Every early return is classified Infra (RPC/proof-construction trouble —
+/// transient, worth retrying) or Semantic (the intent itself is bad — never
+/// worth retrying), matching prove.rs's exit codes 1 and 2.
+fn native_precheck(urls: &[String], tx_hash: &str) -> Result<ProofInput, CheckError> {
+    let tx = rpc_call(urls, "eth_getTransactionByHash", serde_json::json!([tx_hash]))
+        .map_err(|e| CheckError::Infra(format!("failed to fetch tx {tx_hash}: {e}")))?;
+    if tx.is_null() {
+        return Err(CheckError::Infra(format!(
+            "tx {tx_hash} not found via RPC (not yet indexed, or wrong endpoint/network)"
+        )));
     }
-    let block_number = tx["blockNumber"].as_str().ok_or_else(|| anyhow!("no blockNumber"))?.to_string();
-    let tx_index = u64::from_str_radix(
-        tx["transactionIndex"].as_str().ok_or_else(|| anyhow!("no transactionIndex"))?.trim_start_matches("0x"),
-        16,
+    // Deliberately NOT checking tx.to here: a valid intent can arrive via a
+    // smart wallet, an ERC-4337 bundler, or an agent smart account, any of
+    // which make tx.to != IntentManager while still emitting a real
+    // IntentCreated log from IntentManager somewhere in the receipt. The
+    // only thing that matters — here and in the zkVM — is finding that log.
+    let block_number = tx["blockNumber"]
+        .as_str()
+        .ok_or_else(|| CheckError::Infra(format!("tx {tx_hash} has no blockNumber (still pending?)")))?
+        .to_string();
+    let tx_index = hex_to_u64(
+        tx["transactionIndex"]
+            .as_str()
+            .ok_or_else(|| CheckError::Infra(format!("tx {tx_hash} has no transactionIndex")))?,
     )?;
 
-    let block = rpc_call(urls, "eth_getBlockByNumber", serde_json::json!([block_number, false]))?;
-    let header_rlp = header_rlp_bytes(&block)?;
+    let block = rpc_call(urls, "eth_getBlockByNumber", serde_json::json!([block_number, false]))
+        .map_err(|e| CheckError::Infra(format!("failed to fetch block {block_number}: {e}")))?;
+    let header_rlp = header_rlp_bytes(&block)
+        .map_err(|e| CheckError::Infra(format!("failed to encode block {block_number} header: {e}")))?;
+    let block_timestamp = hex_to_u64(
+        block["timestamp"]
+            .as_str()
+            .ok_or_else(|| CheckError::Infra(format!("block {block_number} has no timestamp")))?,
+    )?;
 
-    let receipts = get_block_receipts(urls, &block_number, &block)?;
-    let receipts_arr = receipts.as_array().ok_or_else(|| anyhow!("receipts not an array"))?;
+    let receipts = get_block_receipts(urls, &block_number, &block)
+        .map_err(|e| CheckError::Infra(format!("failed to fetch receipts for block {block_number}: {e}")))?;
+    let receipts_arr = receipts
+        .as_array()
+        .ok_or_else(|| CheckError::Infra(format!("receipts for block {block_number} not an array")))?;
 
     let memdb = Arc::new(MemoryDB::new(true));
     let mut trie = EthTrie::new(memdb);
     for r in receipts_arr {
-        let idx = u64::from_str_radix(
-            r["transactionIndex"].as_str().ok_or_else(|| anyhow!("no txIndex"))?.trim_start_matches("0x"),
-            16,
+        let idx = hex_to_u64(
+            r["transactionIndex"]
+                .as_str()
+                .ok_or_else(|| CheckError::Infra("a receipt in this block is missing transactionIndex".to_string()))?,
         )?;
-        trie.insert(&rlp::encode(&idx).to_vec(), &encode_receipt(r)?).map_err(|e| anyhow!("trie insert failed: {e:?}"))?;
+        let encoded =
+            encode_receipt(r).map_err(|e| CheckError::Infra(format!("proof construction failed (RLP-encoding receipt {idx}): {e}")))?;
+        trie.insert(&rlp::encode(&idx).to_vec(), &encoded)
+            .map_err(|e| CheckError::Infra(format!("proof construction failed (trie insert for receipt {idx}): {e:?}")))?;
     }
 
     let target_receipt = receipts_arr
         .iter()
         .find(|r| r["transactionIndex"].as_str().map(|s| s.trim_start_matches("0x")) == Some(format!("{tx_index:x}").as_str()))
-        .ok_or_else(|| anyhow!("target receipt not found in block receipts"))?;
+        .ok_or_else(|| CheckError::Infra(format!("target receipt (tx_index {tx_index}) not found in block {block_number} receipts")))?;
 
-    let logs = target_receipt["logs"].as_array().ok_or_else(|| anyhow!("no logs on target receipt"))?;
-    let log_index = logs
+    let status = hex_to_u64(
+        target_receipt["status"]
+            .as_str()
+            .ok_or_else(|| CheckError::Infra("target receipt has no status field".to_string()))?,
+    )?;
+    if status != 1 {
+        return Err(CheckError::Semantic(format!("transaction reverted (receipt status = {status}, expected 1)")));
+    }
+
+    let logs = target_receipt["logs"]
+        .as_array()
+        .ok_or_else(|| CheckError::Infra("target receipt has no logs array".to_string()))?;
+
+    // Locate the log exactly as the zkVM does: emitter == IntentManager AND
+    // topic0 == keccak256(IntentCreated signature). tx.to is irrelevant —
+    // see the comment above. log_index is the position of that single
+    // matching log within this receipt's logs array.
+    let matches: Vec<usize> = logs
         .iter()
-        .position(|l| {
+        .enumerate()
+        .filter(|(_, l)| {
             let addr_match = l["address"].as_str().map(|a| a.to_lowercase()) == Some(TARGET_CONTRACT.to_lowercase());
-            let topic0_match = l["topics"].get(0).and_then(Value::as_str).map(|t| t.to_lowercase()) == Some(INTENT_CREATED_TOPIC0.to_lowercase());
+            let topic0_match =
+                l["topics"].get(0).and_then(Value::as_str).map(|t| t.to_lowercase()) == Some(INTENT_CREATED_TOPIC0.to_lowercase());
             addr_match && topic0_match
         })
-        .ok_or_else(|| anyhow!("no IntentCreated log found in target receipt"))? as u64;
+        .map(|(i, _)| i)
+        .collect();
+    let log_pos = match matches.len() {
+        0 => {
+            return Err(CheckError::Semantic(format!(
+                "no IntentCreated log found (emitter == {TARGET_CONTRACT} && topic0 == IntentCreated) in this tx's receipt"
+            )))
+        }
+        // KNOWN LIMITATION: a tx that emits more than one IntentCreated log
+        // from IntentManager (e.g. a batched/multicall tx creating several
+        // intents at once) is rejected rather than proved — this pipeline
+        // proves inclusion of exactly one intent per tx. Revisit if batched
+        // intent creation becomes a real use case.
+        n if n > 1 => return Err(CheckError::Semantic("multiple intents per tx not supported".to_string())),
+        _ => matches[0],
+    };
+    let log_index = log_pos as u64;
+    let log = &logs[log_pos];
+
+    let data = h2b(log["data"].as_str().ok_or_else(|| CheckError::Infra("IntentCreated log has no data field".to_string()))?)
+        .map_err(|e| CheckError::Infra(format!("bad log data hex: {e}")))?;
+    if data.len() != 192 {
+        return Err(CheckError::Infra(format!("unexpected IntentCreated data length {} (expected 192)", data.len())));
+    }
+    let destination_chain_id = be_bytes_to_u64(&data[96..128]);
+    let expiry = be_bytes_to_u64(&data[128..160]);
+
+    if destination_chain_id != EXPECTED_DESTINATION_CHAIN_ID {
+        return Err(CheckError::Semantic(format!(
+            "wrong destination chain: intent targets chain {destination_chain_id}, this deployment only settles to {EXPECTED_DESTINATION_CHAIN_ID}"
+        )));
+    }
+    if expiry <= block_timestamp {
+        return Err(CheckError::Semantic(format!("intent already expired: expiry {expiry} <= block timestamp {block_timestamp}")));
+    }
 
     // eth_trie's get_proof() silently returns an incomplete/wrong proof if
     // called before the trie's in-memory node cache is flushed via
     // root_hash()/commit() — must call it first even though we don't need
-    // the returned root itself here (receipts_root already came from the
+    // the returned root itself here (receiptsRoot already came from the
     // header).
-    trie.root_hash().map_err(|e| anyhow!("root_hash failed: {e:?}"))?;
+    trie.root_hash().map_err(|e| CheckError::Infra(format!("proof construction failed (root_hash): {e:?}")))?;
     let key = rlp::encode(&tx_index).to_vec();
-    let proof = trie.get_proof(&key).map_err(|e| anyhow!("get_proof failed: {e:?}"))?;
+    let proof = trie
+        .get_proof(&key)
+        .map_err(|e| CheckError::Infra(format!("proof construction failed (get_proof): {e:?}")))?;
 
     Ok(ProofInput {
         header_rlp,
         receipt_proof_nodes: proof,
         tx_index,
         log_index,
-        expected_contract: h2b20(TARGET_CONTRACT)?,
+        expected_contract: h2b20(TARGET_CONTRACT)
+            .map_err(|e| CheckError::Infra(format!("bad TARGET_CONTRACT constant: {e}")))?,
     })
 }
 
@@ -306,9 +511,24 @@ async fn main() -> Result<()> {
     let tx_hash = env::args().nth(2).ok_or_else(|| anyhow!("usage: prove <execute|prove> <tx_hash> [--tamper=<kind>]"))?;
     let tamper = env::args().find(|a| a.starts_with("--tamper=")).map(|a| a.trim_start_matches("--tamper=").to_string());
 
-    let urls = rpc_urls()?;
+    let urls = match rpc_urls() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[maat-zk] PRE-CHECK FAILED (infra): {e}");
+            std::process::exit(1);
+        }
+    };
+
     println!("[maat-zk] Building input from tx {tx_hash}...");
-    let mut input = build_real_input(&urls, &tx_hash)?;
+    let mut input = match native_precheck(&urls, &tx_hash) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("[maat-zk] PRE-CHECK FAILED ({}): {}", e.kind(), e);
+            std::process::exit(e.exit_code());
+        }
+    };
+    println!("[maat-zk] Pre-check passed: contract, status, topic0, destination chain, and expiry all OK.");
+
     if let Some(kind) = &tamper {
         println!("[maat-zk] Applying tamper: {kind}");
         input = apply_tamper(input, kind)?;
@@ -358,6 +578,10 @@ async fn main() -> Result<()> {
                     eprintln!("[maat-zk] WARNING: tampered input executed successfully — negative test FAILED");
                     std::process::exit(3);
                 }
+                let vkey = pk.verifying_key().bytes32();
+                if let Err(e) = write_json_output(&output, &tx_hash, "execute", &vkey) {
+                    eprintln!("[maat-zk] WARNING: failed to write output JSON: {e}");
+                }
             }
             Err(e) => {
                 println!("[maat-zk] EXECUTION PANICKED: {e}");
@@ -369,7 +593,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        println!("[maat-zk] MODE: prove (10-30min on CPU)");
+        println!("[maat-zk] MODE: prove (~7 min, ~14GB RAM on CPU)");
         let proof = client
             .prove(&pk, stdin)
             .mode(sp1_sdk::SP1ProofMode::Compressed)
@@ -382,15 +606,24 @@ async fn main() -> Result<()> {
         println!("  vkey:     {}", pk.verifying_key().bytes32());
 
         match client.verify(&proof, pk.verifying_key(), None) {
-            Ok(()) => println!("[maat-zk] PROOF VERIFIED"),
+            Ok(()) => {
+                println!("[maat-zk] PROOF VERIFIED");
+                let intent_id_hex = hex::encode(output.intent_id);
+                let bin_path = format!("proof_{intent_id_hex}.bin");
+                let bin_tmp = format!("{bin_path}.tmp");
+                proof.save(&bin_tmp)?;
+                std::fs::rename(&bin_tmp, &bin_path)?;
+                println!("[maat-zk] Proof saved to: {bin_path}");
+                let vkey = pk.verifying_key().bytes32();
+                if let Err(e) = write_json_output(&output, &tx_hash, "prove", &vkey) {
+                    eprintln!("[maat-zk] WARNING: failed to write output JSON: {e}");
+                }
+            }
             Err(e) => {
                 eprintln!("[maat-zk] PROOF VERIFICATION FAILED: {e}");
                 std::process::exit(4);
             }
         }
-
-        proof.save("proof_output.bin")?;
-        println!("[maat-zk] Proof saved to: proof_output.bin");
     }
 
     Ok(())

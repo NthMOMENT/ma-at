@@ -12,3 +12,7 @@ contracts/evm/cache/
 contracts/evm/out/
 zk/proof_output.bin
 zk/prove_output.log
+zk/proof_*.bin
+zk/proof_*.json
+zk/exec_*.json
+zk/*.tmp
