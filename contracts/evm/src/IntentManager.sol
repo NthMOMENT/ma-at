@@ -3,6 +3,8 @@ pragma solidity 0.8.24;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title IntentManager
 /// @notice Source-chain (Arbitrum Sepolia / Robinhood Chain testnet) contract for Maat.
@@ -11,6 +13,8 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 /// settlement (or slashes a non-performing solver) once a ZK proof of the
 /// destination-chain event is verified off-chain.
 contract IntentManager is ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
     enum IntentStatus {
         Pending,
         Settled,
@@ -21,7 +25,16 @@ contract IntentManager is ReentrancyGuard, Pausable {
     struct Intent {
         address owner;
         uint256 amount;
-        address destinationWallet;
+        /// @dev address(0) = native ETH; any other address = ERC20 token escrowed via transferFrom.
+        address tokenAddress;
+        /// @dev Destination address, encoded per destinationChainId's VM:
+        ///   - EVM chains: abi.encode(address) → left-padded bytes32 (address in the low 20 bytes).
+        ///   - Solana (chainId 1399811149): UTF-8 bytes of the base58 pubkey string,
+        ///     right-padded with zeros to 32 bytes.
+        ///   - TRON Nile (chainId 3448148188): UTF-8 bytes of the base58 address string,
+        ///     right-padded with zeros to 32 bytes.
+        /// The orchestrator uses destinationChainId to pick the right decoding.
+        bytes32 destinationWallet;
         uint64 destinationChainId;
         uint64 expiry;
         uint16 slippageBps;
@@ -51,7 +64,8 @@ contract IntentManager is ReentrancyGuard, Pausable {
         bytes32 indexed intentId,
         address indexed sender,
         uint256 amount,
-        address destinationWallet,
+        address tokenAddress,
+        bytes32 destinationWallet,
         uint64 destinationChainId,
         uint64 expiry,
         uint16 slippageBps
@@ -101,17 +115,26 @@ contract IntentManager is ReentrancyGuard, Pausable {
         lastVolumeReset = block.timestamp;
     }
 
-    /// @notice User escrows ETH and creates a cross-chain intent.
+    /// @notice User escrows ETH (tokenAddress == address(0)) or an ERC20 token
+    /// (tokenAddress == token contract, pulled via transferFrom) and creates a
+    /// cross-chain intent.
     function submitIntent(
+        address tokenAddress,
         uint256 amount,
-        address destinationWallet,
+        bytes32 destinationWallet,
         uint64 destinationChainId,
         uint64 expiry,
         uint16 slippageBps
     ) external payable whenNotPaused nonReentrant returns (bytes32 intentId) {
         if (amount == 0) revert InvalidAmount();
         if (expiry <= block.timestamp) revert ExpiryInPast();
-        if (msg.value != amount) revert IncorrectValue();
+
+        if (tokenAddress == address(0)) {
+            if (msg.value != amount) revert IncorrectValue();
+        } else {
+            if (msg.value != 0) revert IncorrectValue();
+            IERC20(tokenAddress).safeTransferFrom(msg.sender, address(this), amount);
+        }
 
         if (block.timestamp > lastVolumeReset + VOLUME_WINDOW) {
             dailyVolume = 0;
@@ -129,6 +152,7 @@ contract IntentManager is ReentrancyGuard, Pausable {
         intents[intentId] = Intent({
             owner: msg.sender,
             amount: amount,
+            tokenAddress: tokenAddress,
             destinationWallet: destinationWallet,
             destinationChainId: destinationChainId,
             expiry: expiry,
@@ -141,10 +165,17 @@ contract IntentManager is ReentrancyGuard, Pausable {
             settledAt: 0
         });
 
-        emit IntentCreated(intentId, msg.sender, amount, destinationWallet, destinationChainId, expiry, slippageBps);
+        emit IntentCreated(
+            intentId, msg.sender, amount, tokenAddress, destinationWallet, destinationChainId, expiry, slippageBps
+        );
     }
 
     /// @notice Solver overcollateralizes against a pending intent.
+    /// @dev Collateral is always posted in native ETH, regardless of the intent's
+    /// tokenAddress. For ERC20-denominated intents, COLLATERAL_RATIO is applied to
+    /// intent.amount's raw token-unit count, not its ETH-equivalent value — this
+    /// produces a meaningless collateral requirement across assets of differing
+    /// price/decimals until real cross-asset (oracle-based) collateralization is added.
     function postCollateral(bytes32 intentId) external payable whenNotPaused nonReentrant {
         Intent storage intent = intents[intentId];
         if (intent.owner == address(0)) revert IntentDoesNotExist();
@@ -175,8 +206,7 @@ contract IntentManager is ReentrancyGuard, Pausable {
         uint256 amount = intent.amount;
         address solver = intent.solver;
 
-        (bool ok,) = payable(solver).call{value: amount}("");
-        if (!ok) revert EthTransferFailed();
+        _releaseFunds(solver, amount, intent.tokenAddress);
 
         emit IntentSettled(intentId, solver, amount, zkProofHash);
     }
@@ -195,9 +225,9 @@ contract IntentManager is ReentrancyGuard, Pausable {
         uint256 amount = intent.amount;
         uint256 collateral = intent.collateralPosted;
 
-        (bool okUser,) = payable(user).call{value: amount}("");
-        if (!okUser) revert EthTransferFailed();
+        _releaseFunds(user, amount, intent.tokenAddress);
 
+        // Collateral is always native ETH (see postCollateral), independent of the intent's asset.
         (bool okTreasury,) = payable(treasury).call{value: collateral}("");
         if (!okTreasury) revert EthTransferFailed();
 
@@ -215,10 +245,21 @@ contract IntentManager is ReentrancyGuard, Pausable {
         intent.status = IntentStatus.Expired;
 
         uint256 amount = intent.amount;
-        (bool ok,) = payable(msg.sender).call{value: amount}("");
-        if (!ok) revert EthTransferFailed();
+        _releaseFunds(msg.sender, amount, intent.tokenAddress);
 
         emit IntentCancelled(intentId, msg.sender, amount);
+    }
+
+    /// @dev Releases an intent's escrowed `amount` — native ETH if tokenAddress is
+    /// address(0), otherwise the ERC20 token at tokenAddress. Used by confirmSettlement,
+    /// slashSolver, and cancelIntent; never for collateral, which is always native ETH.
+    function _releaseFunds(address to, uint256 amount, address tokenAddress) internal {
+        if (tokenAddress == address(0)) {
+            (bool ok,) = payable(to).call{value: amount}("");
+            if (!ok) revert EthTransferFailed();
+        } else {
+            IERC20(tokenAddress).safeTransfer(to, amount);
+        }
     }
 
     // ------------------- Admin -------------------
