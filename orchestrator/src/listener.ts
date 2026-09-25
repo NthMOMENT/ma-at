@@ -16,6 +16,7 @@ import {
   markSettling,
   markSettled,
   alert,
+  type ProofOutputJson,
 } from "./prover_pipeline";
 import {
   recordIntentCreated,
@@ -27,6 +28,7 @@ import {
   isBlockFinal,
   setFinal,
 } from "./intent_state";
+import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, type SolanaPayoutResult } from "./arbitrum_settlement";
 
 dotenv.config();
 
@@ -34,8 +36,12 @@ dotenv.config();
 
 // Each chain has its own IntentManager deployment — never share one address
 // across chains here, since the two are deployed independently.
-const ARBITRUM_INTENT_MANAGER_ADDRESS = (process.env.ARBITRUM_INTENT_MANAGER_ADDRESS ??
-  "0x9D1bd7119E9FefF6Baa3968272811323B354B16f") as `0x${string}`;
+//
+// Phase 7: ARBITRUM_INTENT_MANAGER_ADDRESS has no hardcoded fallback anymore
+// — there's no "safe default" contract address for a v2 deployment to fall
+// back to, so this fails fast at boot instead (see the check just below the
+// ALCHEMY_RPC_URLS one).
+const ARBITRUM_INTENT_MANAGER_ADDRESS_RAW = process.env.ARBITRUM_INTENT_MANAGER_ADDRESS;
 const ROBINHOOD_INTENT_MANAGER_ADDRESS = (process.env.ROBINHOOD_INTENT_MANAGER_ADDRESS ??
   "0xcA6bf2D574209D49515a9Eeb61E27924edE28860") as `0x${string}`;
 
@@ -62,6 +68,10 @@ const ROBINHOOD_POLL_INTERVAL_MS = Number(process.env.ROBINHOOD_POLL_INTERVAL_MS
 // pollFinality() below.
 const FINALITY_POLL_INTERVAL_MS = Number(process.env.FINALITY_POLL_INTERVAL_MS ?? 60000);
 
+// Phase 7B: how often to check "awaiting_expiry_slash" ledger entries
+// against the wall clock — see pollAwaitingSlash (arbitrum_settlement.ts).
+const SLASH_POLL_INTERVAL_MS = Number(process.env.SLASH_POLL_INTERVAL_MS ?? 60000);
+
 // PROVER_BINARY is imported from ./prover_pipeline (single source of truth
 // for the spawn path, since that's what actually invokes it).
 const SETTLE_SCRIPT = process.env.SETTLE_SCRIPT_PATH ?? path.resolve(__dirname, "../settle_intent.js");
@@ -75,6 +85,11 @@ if (ALCHEMY_RPC_URLS.length === 0) {
   console.error("[FATAL] at least one of ALCHEMY_RPC_URL_1/2/3 must be set in .env");
   process.exit(1);
 }
+if (!ARBITRUM_INTENT_MANAGER_ADDRESS_RAW) {
+  console.error("[FATAL] ARBITRUM_INTENT_MANAGER_ADDRESS must be set in .env — refusing to guess a contract address");
+  process.exit(1);
+}
+const ARBITRUM_INTENT_MANAGER_ADDRESS = ARBITRUM_INTENT_MANAGER_ADDRESS_RAW as `0x${string}`;
 
 // ─── Chain definitions ───────────────────────────────────────────────────────
 
@@ -168,6 +183,14 @@ const rhClient = createPublicClient({
   pollingInterval: ROBINHOOD_POLL_INTERVAL_MS,
 });
 
+// Deps for boot reconciliation and the slash poller — neither ever calls
+// runSolanaPayout (only runArbitrumSettlementSequence, built fresh per
+// intent in triggerZKVerification, does), so this stub throws loudly rather
+// than silently doing nothing if that assumption is ever violated.
+const reconciliationDeps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, () => {
+  throw new Error("runSolanaPayout must not be called from reconciliation/poller deps");
+});
+
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 
 function formatEther(wei: bigint): string {
@@ -256,79 +279,98 @@ function triggerZKVerification(
     // SOLANA_CHAIN_ID, so this always decodes via the Solana branch.
     const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
 
-    console.log(`[SETTLE] all gate checks passed — triggering Solana settlement...`);
-    const settleEnv = {
-      ...process.env,
-      DESTINATION_WALLET: payoutDestination,
-      DESTINATION_CHAIN_ID: json.destination_chain_id.toString(),
-      PROOF_AMOUNT_WEI: json.amount,
-      INTENT_ID: json.intent_id,
-    };
+    console.log(`[SETTLE] all gate checks passed — running Arbitrum settlement sequence (postCollateral -> Solana payout -> confirmSettlement/slashSolver)...`);
+    const deps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, () => runSolanaPayout(intentId, json, payoutDestination));
+    await runArbitrumSettlementSequence(deps, json.intent_id as `0x${string}`, json);
+  });
+}
 
-    await new Promise<void>((resolve) => {
-      const settler = spawn("node", [SETTLE_SCRIPT], { env: settleEnv, stdio: ["pipe", "pipe", "pipe"] });
-      let settleOut = "";
-      let settleErr = "";
-      let sigHandled = false;
-      let settlingSig: string | undefined;
-      settler.stdout.on("data", (d: Buffer) => {
-        settleOut += d.toString();
-        // Fix 6 (Gate 5B-fix): the settling-signature handshake. The child
-        // signs the payout tx, prints SETTLING_SIG:<sig> BEFORE broadcasting
-        // it, then blocks on stdin. We record "settling" with that
-        // signature the instant we see the line (durable, synchronous
-        // write — see markSettling), then unblock the child. A crash
-        // anywhere after this point leaves a signature the next boot can
-        // check on-chain instead of a blind unknown.
-        if (!sigHandled) {
-          const m = settleOut.match(/SETTLING_SIG:(\S+)/);
-          if (m) {
-            sigHandled = true;
-            settlingSig = m[1];
-            markSettling(json.intent_id, m[1]);
-            setSettling(json.intent_id, m[1]);
-            console.log(`[SETTLE] intent ${intentId}: payout tx signed (sig ${m[1]}) — recorded "settling" before broadcast`);
-            settler.stdin.write("GO\n");
-          }
+/// The Solana payout leg (Gate 5B-fix's SETTLING_SIG handshake) — unchanged
+/// behavior, just extracted so arbitrum_settlement.ts's sequence can call it
+/// (and, on failure, retry it) as one step among several instead of it being
+/// triggerZKVerification's terminal action. Per-attempt failures are
+/// reported back via the return value, NOT alert()'d here — the caller
+/// alerts once, after its own retry-until-deadline loop gives up, so a
+/// transient failure during retries doesn't spam alerts.log every attempt.
+async function runSolanaPayout(intentId: string, json: ProofOutputJson, payoutDestination: string): Promise<SolanaPayoutResult> {
+  // Fix 6/8 (Gate 5B-fix), preserved: a settle already recorded "settled"
+  // means a previous attempt (this run or a prior crashed one) already paid
+  // out — report success without re-spawning. "settling" means a
+  // signed-but-unconfirmed tx is waiting on boot reconciliation; never
+  // re-invoke settle_intent.js while that's the case.
+  if (isAlreadySettled(json.intent_id)) {
+    return { ok: true };
+  }
+  if (getLedgerEntry(json.intent_id)?.status === "settling") {
+    return { ok: false, error: "already mid-settlement per local ledger — refusing to re-invoke settle_intent.js" };
+  }
+
+  const settleEnv = {
+    ...process.env,
+    DESTINATION_WALLET: payoutDestination,
+    DESTINATION_CHAIN_ID: json.destination_chain_id.toString(),
+    PROOF_AMOUNT_WEI: json.amount,
+    INTENT_ID: json.intent_id,
+  };
+
+  return new Promise<SolanaPayoutResult>((resolve) => {
+    const settler = spawn("node", [SETTLE_SCRIPT], { env: settleEnv, stdio: ["pipe", "pipe", "pipe"] });
+    let settleOut = "";
+    let settleErr = "";
+    let sigHandled = false;
+    let settlingSig: string | undefined;
+    settler.stdout.on("data", (d: Buffer) => {
+      settleOut += d.toString();
+      // Fix 6 (Gate 5B-fix): the settling-signature handshake. The child
+      // signs the payout tx, prints SETTLING_SIG:<sig> BEFORE broadcasting
+      // it, then blocks on stdin. We record "settling" with that
+      // signature the instant we see the line (durable, synchronous
+      // write — see markSettling), then unblock the child. A crash
+      // anywhere after this point leaves a signature the next boot can
+      // check on-chain instead of a blind unknown.
+      if (!sigHandled) {
+        const m = settleOut.match(/SETTLING_SIG:(\S+)/);
+        if (m) {
+          sigHandled = true;
+          settlingSig = m[1];
+          markSettling(json.intent_id, m[1]);
+          setSettling(json.intent_id, m[1]);
+          console.log(`[SETTLE] intent ${intentId}: payout tx signed (sig ${m[1]}) — recorded "settling" before broadcast`);
+          settler.stdin.write("GO\n");
         }
-      });
-      settler.stderr.on("data", (d: Buffer) => { settleErr += d.toString(); });
-      settler.on("close", (code: number) => {
-        if (code !== 0) {
-          const reason = `settlement script failed (code ${code}): ${settleErr.trim()}`;
-          alert(`intent ${intentId}: ${reason}`);
-          recordAlertReason(intentId, reason);
-          // A signature was recorded as "settling" before this failure —
-          // its actual on-chain fate is now unknown (may have broadcast and
-          // landed anyway), so mirror that ambiguity rather than silently
-          // leaving the display stuck on "settling". No signature yet means
-          // nothing was ever signed, so settlement correctly stays "none".
-          if (settlingSig) setUnconfirmedNeedsReview(json.intent_id, settlingSig);
-          resolve();
-          return;
-        }
-        markSettled(json.intent_id);
-        setSettled(json.intent_id, settlingSig ?? "unknown");
-        const settleTxMatch = settleOut.match(/receive_settlement tx:\s*(\S+)/);
-        const deltaMatch = settleOut.match(/Delta:\s*\+\s*([\d.]+)/);
-        const settleTx = settleTxMatch ? settleTxMatch[1] : "unknown";
-        const delta = deltaMatch ? deltaMatch[1] : "unknown";
-        divider();
-        console.log(`[SETTLE] ─── SOLANA SETTLEMENT COMPLETE ───`);
-        console.log(`[SETTLE]   intentId:   ${intentId}`);
-        console.log(`[SETTLE]   settleTx:   ${settleTx}`);
-        console.log(`[SETTLE]   delivered:  ${delta} SOL`);
-        console.log(`[SETTLE]   destination: ${payoutDestination}`);
-        console.log(`[SETTLE]   note: 1:1 mock rate (devnet). Pyth oracle + Jupiter routing at mainnet.`);
-        divider();
-        resolve();
-      });
-      settler.on("error", (err: Error) => {
-        const reason = `failed to spawn settler: ${err.message}`;
-        alert(`intent ${intentId}: ${reason}`);
-        recordAlertReason(intentId, reason);
-        resolve();
-      });
+      }
+    });
+    settler.stderr.on("data", (d: Buffer) => { settleErr += d.toString(); });
+    settler.on("close", (code: number) => {
+      if (code !== 0) {
+        const reason = `settlement script failed (code ${code}): ${settleErr.trim()}`;
+        // A signature was recorded as "settling" before this failure — its
+        // actual on-chain fate is now unknown (may have broadcast and
+        // landed anyway), so mirror that ambiguity rather than silently
+        // leaving the display stuck on "settling". No signature yet means
+        // nothing was ever signed, so settlement correctly stays "none".
+        if (settlingSig) setUnconfirmedNeedsReview(json.intent_id, settlingSig);
+        resolve({ ok: false, error: reason });
+        return;
+      }
+      markSettled(json.intent_id);
+      setSettled(json.intent_id, settlingSig ?? "unknown");
+      const settleTxMatch = settleOut.match(/receive_settlement tx:\s*(\S+)/);
+      const deltaMatch = settleOut.match(/Delta:\s*\+\s*([\d.]+)/);
+      const settleTx = settleTxMatch ? settleTxMatch[1] : "unknown";
+      const delta = deltaMatch ? deltaMatch[1] : "unknown";
+      divider();
+      console.log(`[SETTLE] ─── SOLANA SETTLEMENT COMPLETE ───`);
+      console.log(`[SETTLE]   intentId:   ${intentId}`);
+      console.log(`[SETTLE]   settleTx:   ${settleTx}`);
+      console.log(`[SETTLE]   delivered:  ${delta} SOL`);
+      console.log(`[SETTLE]   destination: ${payoutDestination}`);
+      console.log(`[SETTLE]   note: 1:1 mock rate (devnet). Pyth oracle + Jupiter routing at mainnet.`);
+      divider();
+      resolve({ ok: true, sig: settlingSig });
+    });
+    settler.on("error", (err: Error) => {
+      resolve({ ok: false, error: `failed to spawn settler: ${err.message}` });
     });
   });
 }
@@ -565,6 +607,7 @@ async function main(): Promise<void> {
   console.log("═".repeat(64) + "\n");
 
   await reconcileSettlingLedger();
+  await reconcileArbitrumLedger(reconciliationDeps, arbClient);
 
   try {
     const arbBlock = await arbClient.getBlockNumber();
@@ -594,6 +637,11 @@ async function main(): Promise<void> {
   setInterval(() => {
     pollFinality().catch((err) => console.error("[FINALITY] poll failed:", (err as Error).message));
   }, FINALITY_POLL_INTERVAL_MS);
+
+  pollAwaitingSlash(reconciliationDeps).catch((err) => console.error("[SLASH] initial poll failed:", (err as Error).message));
+  setInterval(() => {
+    pollAwaitingSlash(reconciliationDeps).catch((err) => console.error("[SLASH] poll failed:", (err as Error).message));
+  }, SLASH_POLL_INTERVAL_MS);
 
   console.log("\n[Orchestrator] Listening. Waiting for intents...\n");
 }

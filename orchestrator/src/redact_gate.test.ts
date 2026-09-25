@@ -1,0 +1,112 @@
+// Gate test (Phase 7B addition): a secret-shaped string reaching alertReason
+// or rejectReason — most concretely, an Alchemy-style RPC URL with its API
+// key baked into the path, which is exactly what a reqwest/viem network
+// error's message can embed — must come out redacted at EVERY sink this
+// process controls: redact() itself, the alerts.log line (prover_pipeline.ts's
+// alert()), and the per-intent state file (intent_state.ts's
+// setAlert/recordAlertReason/setRejected). ma-at-web's own redact() on
+// /api/proofs (lib/proofState.gate.test.ts) is the fourth sink, covered
+// there — this file only covers what lives in this repo.
+//
+// No subprocess spawning here (unlike prover_pipeline_env_gate.test.ts) —
+// fast, and MAAT_STATE_DIR/ALERT_LOG_PATH-scoped so it never touches real
+// state. Run with:
+//
+//   MAAT_STATE_DIR=/tmp/gate-test-redact-state \
+//   ALERT_LOG_PATH=/tmp/gate-test-redact-alerts.log \
+//   npx ts-node src/redact_gate.test.ts
+import * as fs from "fs";
+
+for (const v of ["MAAT_STATE_DIR", "ALERT_LOG_PATH"]) {
+  if (!process.env[v]) {
+    console.error(`[gate-test] refusing to run without ${v} set (would touch real state)`);
+    process.exit(1);
+  }
+}
+
+// Imported after the env checks above — intent_state.ts reads MAAT_STATE_DIR
+// and prover_pipeline.ts reads ALERT_LOG_PATH once, at module load.
+import { redact } from "./redact";
+import { readState, setAlert, recordAlertReason, setRejected } from "./intent_state";
+import { alert } from "./prover_pipeline";
+
+const FAKE_URL_WITH_KEY = "https://arb-sepolia.g.alchemy.com/v2/FAKEKEY123";
+
+let failures = 0;
+function check(name: string, cond: boolean): void {
+  if (cond) {
+    console.log(`  ok   ${name}`);
+  } else {
+    console.error(`  FAIL ${name}`);
+    failures++;
+  }
+}
+
+console.log("[gate-test] 1) redact() strips the exact Alchemy-style URL+key");
+{
+  const out = redact(`request failed: ${FAKE_URL_WITH_KEY} timed out`);
+  check("URL gone", !out.includes(FAKE_URL_WITH_KEY));
+  check("key gone", !out.includes("FAKEKEY123"));
+  check("placeholder present", out.includes("[redacted-url]"));
+}
+
+console.log("[gate-test] 2) alert() writes a redacted line to ALERT_LOG_PATH, not the raw URL");
+{
+  // 0x-prefixed hex, matching this codebase's own hash/ID convention (see
+  // redact.ts's doc comment) — a hyphenated human-readable label would get
+  // swept up by the long-opaque-token pass too, which is correct behavior,
+  // not something to test around.
+  const intentId = "0x" + "ee".repeat(32);
+  alert(`intent ${intentId}: RPC error: ${FAKE_URL_WITH_KEY}`);
+  const logContent = fs.readFileSync(process.env.ALERT_LOG_PATH as string, "utf8");
+  check("alerts.log mentions this test's intent id", logContent.includes(intentId));
+  check("alerts.log does NOT contain the raw URL", !logContent.includes(FAKE_URL_WITH_KEY));
+  check("alerts.log does NOT contain the raw key", !logContent.includes("FAKEKEY123"));
+  check("alerts.log contains the redaction placeholder", logContent.includes("[redacted-url]"));
+}
+
+console.log("[gate-test] 3) setAlert() persists a redacted alertReason to the state file");
+{
+  const intentId = "0x" + "aa".repeat(32);
+  setAlert(intentId, `settlement spawn failed: ${FAKE_URL_WITH_KEY}`);
+  const state = readState(intentId);
+  check("state record exists", state !== null);
+  check("alertReason does NOT contain the raw URL", !!state && !state.alertReason?.includes(FAKE_URL_WITH_KEY));
+  check("alertReason does NOT contain the raw key", !!state && !state.alertReason?.includes("FAKEKEY123"));
+  check("alertReason contains the redaction placeholder", !!state && !!state.alertReason?.includes("[redacted-url]"));
+}
+
+console.log("[gate-test] 4) recordAlertReason() persists a redacted alertReason without touching proofStatus");
+{
+  const intentId = "0x" + "bb".repeat(32);
+  recordAlertReason(intentId, `failed to fetch canonical block: ${FAKE_URL_WITH_KEY}`);
+  const state = readState(intentId);
+  check("state record exists", state !== null);
+  check("alertReason does NOT contain the raw URL", !!state && !state.alertReason?.includes(FAKE_URL_WITH_KEY));
+  check("alertReason contains the redaction placeholder", !!state && !!state.alertReason?.includes("[redacted-url]"));
+}
+
+console.log("[gate-test] 5) setRejected() persists a redacted rejectReason to the state file");
+{
+  const intentId = "0x" + "cc".repeat(32);
+  setRejected(intentId, `semantic reject: upstream said ${FAKE_URL_WITH_KEY}`);
+  const state = readState(intentId);
+  check("state record exists", state !== null);
+  check("rejectReason does NOT contain the raw URL", !!state && !state.rejectReason?.includes(FAKE_URL_WITH_KEY));
+  check("rejectReason contains the redaction placeholder", !!state && !!state.rejectReason?.includes("[redacted-url]"));
+}
+
+console.log("[gate-test] 6) redact() does NOT over-redact an env var NAME or an 0x-prefixed id (regression guard)");
+{
+  const envName = redact("ARBITRUM_INTENT_MANAGER_ADDRESS is not set");
+  check("env var name survives", envName.includes("ARBITRUM_INTENT_MANAGER_ADDRESS"));
+  const idText = "intent 0x" + "dd".repeat(32) + ": ok";
+  check("0x-prefixed id survives", redact(idText) === idText);
+}
+
+if (failures > 0) {
+  console.error(`\n[gate-test] ${failures} check(s) FAILED`);
+  process.exit(1);
+} else {
+  console.log(`\n[gate-test] all checks passed`);
+}

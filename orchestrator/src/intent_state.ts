@@ -14,6 +14,7 @@
 // that ledger's outcome, for display — never consult it for the gate.
 import * as fs from "fs";
 import * as path from "path";
+import { redact } from "./redact";
 
 export const STATE_DIR = process.env.MAAT_STATE_DIR ?? path.resolve(__dirname, "../state/intents");
 
@@ -35,6 +36,29 @@ export interface SettlementStatus {
   kind: SettlementKind;
   /** The Solana payout tx signature, once signed. */
   sig?: string;
+}
+
+// Phase 7B: mirrors arbitrum_ledger.ts's stage machine for display only —
+// that ledger (in arbitrum_settlement.ts) remains the actual authority for
+// whether a tx may be (re)broadcast; never gate on this field.
+export type ArbitrumSettlementStage =
+  | "none"
+  | "posting_collateral"
+  | "collateral_posted"
+  | "collateral_failed"
+  | "confirming"
+  | "confirmed"
+  | "awaiting_expiry_slash"
+  | "slashing"
+  | "slashed";
+
+export interface ArbitrumSettlementStatus {
+  stage: ArbitrumSettlementStage;
+  collateralTxHash?: string;
+  confirmTxHash?: string;
+  slashTxHash?: string;
+  /** Redacted before storage — see setArbitrumSettlement. */
+  reason?: string;
 }
 
 export type FinalityStatus = "pending" | "final";
@@ -72,6 +96,7 @@ export interface IntentState {
    */
   alertReason: string | null;
   settlement: SettlementStatus;
+  arbitrumSettlement: ArbitrumSettlementStatus;
   finality: FinalityStatus;
   timestamps: IntentStateTimestamps;
   updatedAt: string;
@@ -125,6 +150,7 @@ function blankState(intentId: string): IntentState {
     rejectReason: null,
     alertReason: null,
     settlement: { kind: "none" },
+    arbitrumSettlement: { stage: "none" },
     finality: "pending",
     timestamps: {},
     updatedAt: new Date().toISOString(),
@@ -201,17 +227,17 @@ export function setVerified(intentId: string, vkey: string): void {
 }
 
 export function setRejected(intentId: string, reason: string): void {
-  upsert(intentId, (prev) => ({ ...prev, proofStatus: { kind: "rejected" }, rejectReason: reason }));
+  upsert(intentId, (prev) => ({ ...prev, proofStatus: { kind: "rejected" }, rejectReason: redact(reason) }));
 }
 
 export function setAlert(intentId: string, reason: string): void {
-  upsert(intentId, (prev) => ({ ...prev, proofStatus: { kind: "alert" }, alertReason: reason }));
+  upsert(intentId, (prev) => ({ ...prev, proofStatus: { kind: "alert" }, alertReason: redact(reason) }));
 }
 
 /** Records an alert's text without downgrading proofStatus — see the
  *  `alertReason` doc comment on IntentState for why. */
 export function recordAlertReason(intentId: string, reason: string): void {
-  upsert(intentId, (prev) => ({ ...prev, alertReason: reason }));
+  upsert(intentId, (prev) => ({ ...prev, alertReason: redact(reason) }));
 }
 
 // ─── Stage transitions — settlement side ─────────────────────────────────────
@@ -236,6 +262,20 @@ export function setSettled(intentId: string, sig: string): void {
 
 export function setUnconfirmedNeedsReview(intentId: string, sig: string): void {
   upsert(intentId, (prev) => ({ ...prev, settlement: { kind: "unconfirmed-needs-review", sig } }));
+}
+
+// Phase 7B: display mirror for arbitrum_settlement.ts's ledger — partial
+// patch merged onto the previous arbitrumSettlement, so each stage
+// transition only needs to pass the fields it actually knows about.
+export function setArbitrumSettlement(intentId: string, patch: Partial<ArbitrumSettlementStatus>): void {
+  upsert(intentId, (prev) => ({
+    ...prev,
+    arbitrumSettlement: {
+      ...prev.arbitrumSettlement,
+      ...patch,
+      reason: patch.reason !== undefined ? redact(patch.reason) : prev.arbitrumSettlement.reason,
+    },
+  }));
 }
 
 // ─── Finality (orchestrator-side poller only — see listener.ts) ─────────────

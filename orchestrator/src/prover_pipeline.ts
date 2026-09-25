@@ -8,6 +8,7 @@ import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { setProving, setRetrying, setVerified, setRejected, setAlert } from "./intent_state";
+import { redact } from "./redact";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -69,7 +70,10 @@ export interface ProofOutputJson {
 const ALERT_LOG = process.env.ALERT_LOG_PATH ?? path.resolve(__dirname, "../alerts.log");
 
 export function alert(message: string): void {
-  const line = `[${new Date().toISOString()}] ${message}`;
+  // Redact before this line is ever formatted — it's both logged to console
+  // and appended to ALERT_LOG, and (Phase 7) message can now carry a prover
+  // subprocess's raw stderr, which can itself embed an RPC URL/API key.
+  const line = `[${new Date().toISOString()}] ${redact(message)}`;
   console.error(`[ALERT] ${line}`);
   try {
     fs.appendFileSync(ALERT_LOG, line + "\n");
@@ -181,13 +185,28 @@ export function getSettlingEntries(): Array<{ intentId: string; solanaSig: strin
 // volume; each process's own jobs are still strictly FIFO via ProverQueue
 // below.
 
-function runProverProcess(txHash: string): Promise<number> {
+interface ProverProcessResult {
+  code: number;
+  /// Last chunk of stderr the child wrote — captured (in addition to being
+  /// streamed live to our own stderr) so a config-style failure like a
+  /// missing required env var can be surfaced as a CLEAR reason in the
+  /// eventual alert/state, not just an opaque exit code.
+  stderrTail: string;
+}
+
+function runProverProcess(txHash: string): Promise<ProverProcessResult> {
   return new Promise((resolve) => {
     const args = [
       LOCK_FILE,
       "systemd-run",
       "--scope",
-      "--wait",
+      // NOT --wait: `--wait` is a service-unit flag ("wait until service
+      // stopped again") and systemd-run rejects it outright when combined
+      // with --scope ("--wait may not be combined with --scope") — verified
+      // against the installed systemd-run. --scope is already synchronous
+      // (systemd-run forks+execs the target directly and returns only once
+      // it exits), so nothing else needs to change; flock's own release
+      // still happens exactly when the wrapped process group exits.
       "--collect",
       "-p",
       "MemoryMax=14G",
@@ -207,14 +226,29 @@ function runProverProcess(txHash: string): Promise<number> {
       cwd: ZK_DIR,
       env: { ...process.env, SP1_PROVER: "cpu" },
     });
+    let stderrBuf = "";
     proc.stdout.on("data", (d: Buffer) => process.stdout.write(`[PROVER] ${d}`));
-    proc.stderr.on("data", (d: Buffer) => process.stderr.write(`[PROVER] ${d}`));
-    proc.on("close", (code) => resolve(code ?? 1));
+    proc.stderr.on("data", (d: Buffer) => {
+      process.stderr.write(`[PROVER] ${d}`);
+      stderrBuf += d.toString();
+    });
+    proc.on("close", (code) => resolve({ code: code ?? 1, stderrTail: stderrBuf.slice(-2000) }));
     proc.on("error", (err) => {
       console.error(`[PROVER] failed to spawn flock/systemd-run:`, err.message);
-      resolve(1); // couldn't even start — infra, retry
+      resolve({ code: 1, stderrTail: `failed to spawn flock/systemd-run: ${err.message}` }); // couldn't even start — infra, retry
     });
   });
+}
+
+/// Last non-empty line of a stderr capture — almost always the actual
+/// `[maat-zk] PRE-CHECK FAILED (...): ...` or panic message, without dumping
+/// the whole (possibly multi-KB) tail into a one-line alert reason.
+function lastStderrLine(stderrTail: string): string {
+  const lines = stderrTail
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return lines.length > 0 ? lines[lines.length - 1] : "";
 }
 
 function readProofJson(intentIdHex: string): ProofOutputJson | null {
@@ -251,13 +285,19 @@ export type ProverOutcome =
 export async function proveIntent(txHash: string, intentIdHex: string): Promise<ProverOutcome> {
   setProving(intentIdHex);
   for (let attempt = 1; attempt <= MAX_PROVER_RETRIES; attempt++) {
-    const code = await runProverProcess(txHash);
+    const { code, stderrTail } = await runProverProcess(txHash);
 
     if (code === 0) {
       const json = readProofJson(intentIdHex);
       if (!json) {
         const reason = "prover exited 0 but its output was missing/invalid — not settling";
-        alert(`intent ${intentIdHex}: ${reason}`);
+        // 0x-prefixed here (intentIdHex itself is bare, unprefixed hex) so
+        // redact()'s bare-hash/ID exemption applies to it — matches this
+        // codebase's own hash/ID convention (see intent_id in prove.rs's
+        // ProofOutputJson) rather than relying on redact() special-casing
+        // unprefixed hex, which would also have to exempt a raw hex-encoded
+        // private key if one ever leaked into a message this way.
+        alert(`intent 0x${intentIdHex}: ${reason}`);
         setAlert(intentIdHex, reason);
         return { status: "alert" };
       }
@@ -271,22 +311,33 @@ export async function proveIntent(txHash: string, intentIdHex: string): Promise<
     }
     if (code === 4) {
       const reason = "proof FAILED VERIFICATION (exit 4) — never settling";
-      alert(`intent ${intentIdHex}: ${reason}`);
+      alert(`intent 0x${intentIdHex}: ${reason}`);
       setAlert(intentIdHex, reason);
       return { status: "alert" };
     }
 
     // exit 1, or any other/unexpected code (e.g. OOM-killed by the
     // MemoryMax=14G cgroup limit, or killed by RuntimeMaxSec's timeout) —
-    // treated as infra, retry with backoff.
+    // treated as infra, retry with backoff. detail (when present) is prove.rs's
+    // own last stderr line — e.g. "PRE-CHECK FAILED (infra): ARBITRUM_INTENT_
+    // MANAGER_ADDRESS is not set" — so a deterministic config error reads as
+    // exactly that in the final alert, not just an opaque "last exit 1".
+    const detail = lastStderrLine(stderrTail);
     if (attempt === MAX_PROVER_RETRIES) {
-      const reason = `prover failed ${MAX_PROVER_RETRIES}/${MAX_PROVER_RETRIES} attempts (last exit ${code}) — giving up, never settling`;
-      alert(`intent ${intentIdHex}: ${reason}`);
+      const reason =
+        `prover failed ${MAX_PROVER_RETRIES}/${MAX_PROVER_RETRIES} attempts (last exit ${code}` +
+        (detail ? `: ${detail}` : "") +
+        `) — giving up, never settling`;
+      alert(`intent 0x${intentIdHex}: ${reason}`);
       setAlert(intentIdHex, reason);
       return { status: "alert" };
     }
     const backoff = RETRY_BACKOFF_MS[attempt - 1] ?? RETRY_BACKOFF_MS[RETRY_BACKOFF_MS.length - 1];
-    console.warn(`[PROVER] intent ${intentIdHex}: exit ${code} (infra) on attempt ${attempt}/${MAX_PROVER_RETRIES} — retrying in ${backoff}ms`);
+    console.warn(
+      `[PROVER] intent ${intentIdHex}: exit ${code} (infra) on attempt ${attempt}/${MAX_PROVER_RETRIES}` +
+        (detail ? ` — ${detail}` : "") +
+        ` — retrying in ${backoff}ms`
+    );
     setRetrying(intentIdHex, attempt + 1, MAX_PROVER_RETRIES);
     await sleep(backoff);
   }

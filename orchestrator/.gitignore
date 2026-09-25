@@ -4,3 +4,4 @@ dist/
 *.log
 state/
 settled_intents.json
+arbitrum_settled_intents.json
