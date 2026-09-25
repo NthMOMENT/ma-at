@@ -27,3 +27,16 @@ export function redact(text: string): string {
     // than relying on this function to guess.
     .replace(/\b(?!0x)(?![A-Z][A-Z0-9_]*\b)[A-Za-z0-9_-]{24,}\b/g, "[redacted]");
 }
+
+// Gate 5D-fix: the console-output half of the same guarantee — every
+// viem/TronGrid/network error logged to stdout/stderr (which PM2 persists
+// to log files) must be redacted first, exactly like alertReason/
+// rejectReason already are before they reach disk. Centralized here (rather
+// than each caller reimplementing "err instanceof Error ? err.message :
+// String(err)") so it's directly unit-testable without importing any
+// entrypoint file (listener.ts, tron_listener.ts) and its boot side effects
+// — see redact_gate.test.ts.
+export function redactError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return redact(message);
+}

@@ -3,9 +3,39 @@ const anchor = require('@coral-xyz/anchor');
 const fs = require('fs');
 const path = require('path');
 
-const HOT_WALLET_PATH = process.env.HOME + '/.config/solana/hot-wallet.json';
-const PROGRAM_ID = new PublicKey('9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv');
-const IDL_PATH = path.join(__dirname, 'maat_idl.json');
+// Converts wei (18-decimal ETH) to lamports (9-decimal SOL) at a true 1:1
+// ETH:SOL mock rate (devnet only): wei and lamports differ by exactly 1e9,
+// so integer-dividing by 1e9 gives the same-magnitude SOL amount. Accepts
+// either a decimal or 0x-prefixed hex string (BigInt() parses both, and
+// prove.rs's ProofOutputJson.amount is hex-encoded).
+//
+// Exported, and defined + exported before any of this file's side-effecting
+// top-level code below (which only runs under require.main === module), so
+// it's directly unit-testable without touching Solana, the hot wallet, or
+// any env var — see settle_intent.gate.test.js.
+function weiToLamports(weiStr) {
+  return BigInt(weiStr) / 1_000_000_000n;
+}
+
+module.exports = { weiToLamports };
+
+// Everything below only runs when this file is executed directly (`node
+// settle_intent.js`), never on require() — e.g. from a test importing
+// weiToLamports. Gate 5D-fix: reading env vars / touching the filesystem at
+// module-load time (outside this guard) is exactly the ordering bug that hit
+// listener.ts — see dotenv/config there for the general fix; guarding this
+// script's side effects behind require.main === module is the equivalent
+// fix here, and additionally makes weiToLamports importable in isolation.
+if (require.main === module) {
+  runSettlement().catch((err) => {
+    // Fix 6 (Gate 5B-fix): must actually exit non-zero on failure (including
+    // the waitForGo() timeout below) — listener.ts's `code !== 0` alert path
+    // depends on it. The old `.catch(console.error)` swallowed the error and
+    // let the process exit 0 by default.
+    console.error(err);
+    process.exit(1);
+  });
+}
 
 // Fix 6 (Gate 5B-fix): blocks after printing SETTLING_SIG until the parent
 // (listener.ts) writes "GO" to our stdin — i.e. until it has durably
@@ -28,51 +58,54 @@ function waitForGo(timeoutMs = 30_000) {
   });
 }
 
-// Settlement destination — decoded by the orchestrator listener from the
-// EVM/TRON IntentCreated event's destinationWallet and passed in via env.
-// Falls back to the treasury wallet only when run standalone (e.g. manual testing).
-const DESTINATION_CHAIN_ID = process.env.DESTINATION_CHAIN_ID || '1399811149';
-const DESTINATION_WALLET = process.env.DESTINATION_WALLET
-  || 'C9CZZFbeJ2Vzj9w8ctcsYKyK4mLQNq2vvsGwPJ7uEHtd';
+async function runSettlement() {
+  const HOT_WALLET_PATH = process.env.HOME + '/.config/solana/hot-wallet.json';
+  const PROGRAM_ID = new PublicKey('9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv');
+  const IDL_PATH = path.join(__dirname, 'maat_idl.json');
 
-const SOLANA_CHAIN_ID = '1399811149';
+  // Settlement destination — decoded by the orchestrator listener from the
+  // EVM/TRON IntentCreated event's destinationWallet and passed in via env.
+  // Falls back to the treasury wallet only when run standalone (e.g. manual testing).
+  const DESTINATION_CHAIN_ID = process.env.DESTINATION_CHAIN_ID || '1399811149';
+  const DESTINATION_WALLET = process.env.DESTINATION_WALLET
+    || 'C9CZZFbeJ2Vzj9w8ctcsYKyK4mLQNq2vvsGwPJ7uEHtd';
 
-// This settlement script only knows how to deliver SOL on Solana. The
-// listener also fires it for EVM/TRON-destined intents (its job stops at ZK
-// verification), so route those out here rather than letting them fail deep
-// inside the Solana PublicKey/Anchor calls below.
-if (DESTINATION_CHAIN_ID !== SOLANA_CHAIN_ID) {
-  console.log('[SETTLE] Non-Solana destination detected.');
-  console.log('[SETTLE] Cross-chain settlement to EVM/TRON not yet implemented.');
-  console.log('[SETTLE] Destination:', DESTINATION_WALLET);
-  console.log('[SETTLE] Chain:', DESTINATION_CHAIN_ID);
-  process.exit(0);
-}
+  const SOLANA_CHAIN_ID = '1399811149';
 
-const DESTINATION = new PublicKey(DESTINATION_WALLET);
+  // This settlement script only knows how to deliver SOL on Solana. The
+  // listener also fires it for EVM/TRON-destined intents (its job stops at ZK
+  // verification), so route those out here rather than letting them fail deep
+  // inside the Solana PublicKey/Anchor calls below.
+  if (DESTINATION_CHAIN_ID !== SOLANA_CHAIN_ID) {
+    console.log('[SETTLE] Non-Solana destination detected.');
+    console.log('[SETTLE] Cross-chain settlement to EVM/TRON not yet implemented.');
+    console.log('[SETTLE] Destination:', DESTINATION_WALLET);
+    console.log('[SETTLE] Chain:', DESTINATION_CHAIN_ID);
+    process.exit(0);
+  }
 
-// Fix 8 (Gate 5B-fix): settlement amount comes ONLY from the proof JSON's
-// committed `amount` field (hex wei string), passed in via env by
-// listener.ts — never a hardcoded figure. 1:1 mock rate (devnet): wei (18
-// decimals) and lamports (9 decimals) differ by exactly 1e9, so dividing
-// gives the same-magnitude SOL amount. Refuses to run rather than guess.
-const PROOF_AMOUNT_WEI = process.env.PROOF_AMOUNT_WEI;
-if (!PROOF_AMOUNT_WEI) {
-  console.error('[SETTLE] PROOF_AMOUNT_WEI not set — refusing to settle with an unknown amount.');
-  process.exit(1);
-}
-const SETTLEMENT_AMOUNT = new anchor.BN((BigInt(PROOF_AMOUNT_WEI) / 1_000_000_000n).toString());
+  const DESTINATION = new PublicKey(DESTINATION_WALLET);
 
-// Arbitrum Sepolia source chain ID
-const SOURCE_CHAIN_ID = new anchor.BN(421614);
+  // Fix 8 (Gate 5B-fix): settlement amount comes ONLY from the proof JSON's
+  // committed `amount` field (hex wei string), passed in via env by
+  // listener.ts — never a hardcoded figure. See weiToLamports above for the
+  // 1:1 mock-rate conversion. Refuses to run rather than guess.
+  const PROOF_AMOUNT_WEI = process.env.PROOF_AMOUNT_WEI;
+  if (!PROOF_AMOUNT_WEI) {
+    console.error('[SETTLE] PROOF_AMOUNT_WEI not set — refusing to settle with an unknown amount.');
+    process.exit(1);
+  }
+  const SETTLEMENT_AMOUNT = new anchor.BN(weiToLamports(PROOF_AMOUNT_WEI).toString());
 
-// ZK proof hash from our verified intent
-const ZK_PROOF_HASH = Buffer.from(
-  '007500eb44bf57ff9ed9585585e438b3f57e4285c578b61df832eb9fd4fd32e3',
-  'hex'
-);
+  // Arbitrum Sepolia source chain ID
+  const SOURCE_CHAIN_ID = new anchor.BN(421614);
 
-async function main() {
+  // ZK proof hash from our verified intent
+  const ZK_PROOF_HASH = Buffer.from(
+    '007500eb44bf57ff9ed9585585e438b3f57e4285c578b61df832eb9fd4fd32e3',
+    'hex'
+  );
+
   const keypairData = JSON.parse(fs.readFileSync(HOT_WALLET_PATH));
   const hotWallet = Keypair.fromSecretKey(Uint8Array.from(keypairData));
   console.log('Hot wallet (solver):', hotWallet.publicKey.toBase58());
@@ -205,12 +238,3 @@ async function main() {
   console.log('  Destination:', DESTINATION.toBase58());
   console.log('  Settlement tx:', settleTx);
 }
-
-main().catch((err) => {
-  // Fix 6 (Gate 5B-fix): must actually exit non-zero on failure (including
-  // the waitForGo() timeout above) — listener.ts's `code !== 0` alert path
-  // depends on it. The old `.catch(console.error)` swallowed the error and
-  // let the process exit 0 by default.
-  console.error(err);
-  process.exit(1);
-});

@@ -1,6 +1,19 @@
+// Gate 5D-fix: MUST be the first import in this file. TypeScript compiles
+// `import "x"` to a plain `require("x")` positioned exactly where it's
+// written — imports are NOT force-hoisted above other code the way native
+// ESM `import` statements are — so every subsequent import below (in
+// particular ./prover_pipeline, ./intent_state, ./arbitrum_settlement, all
+// of which read process.env at module load) only sees populated env vars if
+// dotenv has already run by the time they're required. The previous
+// `import * as dotenv from "dotenv"; ... dotenv.config();` pattern put the
+// actual .config() call AFTER those sibling imports — a call that arrives
+// too late fails silently for anything with a safe default (wrong path
+// picked quietly) and fails LOUDLY for anything that fails fast on unset,
+// which is exactly what surfaced this as ARBITRUM_SOLVER_PRIVATE_KEY "not
+// set" despite being present in .env.
+import "dotenv/config";
 import { createPublicClient, http, fallback, parseAbiItem, type Log, type Chain } from "viem";
 import { arbitrumSepolia } from "viem/chains";
-import * as dotenv from "dotenv";
 import { spawn } from "child_process";
 import * as path from "path";
 import { createHash } from "crypto";
@@ -29,8 +42,15 @@ import {
   setFinal,
 } from "./intent_state";
 import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, type SolanaPayoutResult } from "./arbitrum_settlement";
+import { redactError } from "./redact";
 
-dotenv.config();
+// Gate 5D-fix: every viem watcher/transport error must pass through here
+// before being logged — a viem HTTP transport error's message embeds the
+// full request URL (Alchemy API key and all, in the path), and this
+// process's stdout/stderr feed PM2's log files directly.
+function logError(prefix: string, err: unknown): void {
+  console.error(prefix, redactError(err));
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -55,6 +75,11 @@ const ROBINHOOD_RPC_URL = process.env.ROBINHOOD_RPC_URL ?? "https://rpc.testnet.
 // Optional Alchemy-backed fallback for Robinhood Testnet (documented in
 // .env.example but never wired up before now).
 const ROBINHOOD_ALCHEMY_RPC_URL = process.env.ROBINHOOD_ALCHEMY_RPC_URL;
+// Gate 5D-fix (item 3): Robinhood is disabled by default for the MVP —
+// Arbitrum only. It was already a dead end for proving (see logIntentCreated's
+// chain-label skip), so this just removes the unused RPC traffic/connection
+// attempt entirely rather than watching a chain nothing downstream acts on.
+const ENABLE_ROBINHOOD = process.env.ENABLE_ROBINHOOD === "true";
 
 // Per-chain watch polling intervals (Decision 2, Gate 5C briefing) — each
 // independently configurable since the two chains have very different block
@@ -445,7 +470,7 @@ function logIntentCreated(log: Log, chainLabel: string): void {
     triggerZKVerification(log.transactionHash, args.intentId, decodedDestination, args.destinationChainId);
 
   } catch (err) {
-    console.error(`[ERROR] Failed to process IntentCreated log on ${chainLabel}:`, err);
+    logError(`[ERROR] Failed to process IntentCreated log on ${chainLabel}:`, err);
   }
 }
 
@@ -468,7 +493,7 @@ function logCollateralPosted(log: Log, chainLabel: string): void {
     console.log(`  blockNumber:      ${log.blockNumber?.toString()}`);
     divider();
   } catch (err) {
-    console.error(`[ERROR] Failed to process CollateralPosted log on ${chainLabel}:`, err);
+    logError(`[ERROR] Failed to process CollateralPosted log on ${chainLabel}:`, err);
   }
 }
 
@@ -493,7 +518,7 @@ function logIntentSettled(log: Log, chainLabel: string): void {
     console.log(`  blockNumber: ${log.blockNumber?.toString()}`);
     divider();
   } catch (err) {
-    console.error(`[ERROR] Failed to process IntentSettled log on ${chainLabel}:`, err);
+    logError(`[ERROR] Failed to process IntentSettled log on ${chainLabel}:`, err);
   }
 }
 
@@ -511,7 +536,7 @@ function watchChain(
     abi: INTENT_MANAGER_ABI,
     eventName: "IntentCreated",
     onLogs: (logs) => logs.forEach((log) => logIntentCreated(log, chainLabel)),
-    onError: (err) => console.error(`[${chainLabel}] IntentCreated watcher error:`, err.message),
+    onError: (err) => logError(`[${chainLabel}] IntentCreated watcher error:`, err),
   });
 
   client.watchContractEvent({
@@ -519,7 +544,7 @@ function watchChain(
     abi: INTENT_MANAGER_ABI,
     eventName: "CollateralPosted",
     onLogs: (logs) => logs.forEach((log) => logCollateralPosted(log, chainLabel)),
-    onError: (err) => console.error(`[${chainLabel}] CollateralPosted watcher error:`, err.message),
+    onError: (err) => logError(`[${chainLabel}] CollateralPosted watcher error:`, err),
   });
 
   client.watchContractEvent({
@@ -527,7 +552,7 @@ function watchChain(
     abi: INTENT_MANAGER_ABI,
     eventName: "IntentSettled",
     onLogs: (logs) => logs.forEach((log) => logIntentSettled(log, chainLabel)),
-    onError: (err) => console.error(`[${chainLabel}] IntentSettled watcher error:`, err.message),
+    onError: (err) => logError(`[${chainLabel}] IntentSettled watcher error:`, err),
   });
 }
 
@@ -585,7 +610,7 @@ async function pollFinality(): Promise<void> {
     if (block.number == null) return;
     finalizedBlockNumber = Number(block.number);
   } catch (err) {
-    console.error(`[FINALITY] failed to fetch Arbitrum Sepolia's finalized block:`, (err as Error).message);
+    logError(`[FINALITY] failed to fetch Arbitrum Sepolia's finalized block:`, err);
     return;
   }
 
@@ -613,18 +638,27 @@ async function main(): Promise<void> {
     const arbBlock = await arbClient.getBlockNumber();
     console.log(`[Arbitrum Sepolia] Connected. Latest block: ${arbBlock}`);
   } catch (err) {
-    console.error("[FATAL] Cannot connect to Arbitrum Sepolia RPC:", (err as Error).message);
+    logError("[FATAL] Cannot connect to Arbitrum Sepolia RPC:", err);
     process.exit(1);
   }
 
-  let robinhoodAvailable = true;
-  try {
-    const rhBlock = await rhClient.getBlockNumber();
-    console.log(`[Robinhood Testnet] Connected. Latest block: ${rhBlock}`);
-  } catch (err) {
-    robinhoodAvailable = false;
-    console.warn("[WARN] Cannot connect to Robinhood Testnet RPC. Skipping its watcher.");
-    console.warn(`  Error: ${(err as Error).message}`);
+  // Gate 5D-fix (item 3): Robinhood is fully disabled for the MVP — no
+  // connection attempt, no watcher — unless explicitly re-enabled. It was
+  // already a dead end past logIntentCreated's chain-label skip (no prover
+  // support for it), so there's no behavior loss, only less RPC traffic and
+  // log noise.
+  let robinhoodAvailable = false;
+  if (ENABLE_ROBINHOOD) {
+    try {
+      const rhBlock = await rhClient.getBlockNumber();
+      console.log(`[Robinhood Testnet] Connected. Latest block: ${rhBlock}`);
+      robinhoodAvailable = true;
+    } catch (err) {
+      console.warn("[WARN] Cannot connect to Robinhood Testnet RPC. Skipping its watcher.");
+      logError("  Error:", err);
+    }
+  } else {
+    console.log("[Robinhood Testnet] Disabled (set ENABLE_ROBINHOOD=true to re-enable) — Arbitrum only for the MVP.");
   }
 
   console.log("");
@@ -633,28 +667,28 @@ async function main(): Promise<void> {
     watchChain(rhClient, "Robinhood Testnet", ROBINHOOD_INTENT_MANAGER_ADDRESS);
   }
 
-  pollFinality().catch((err) => console.error("[FINALITY] initial poll failed:", (err as Error).message));
+  pollFinality().catch((err) => logError("[FINALITY] initial poll failed:", err));
   setInterval(() => {
-    pollFinality().catch((err) => console.error("[FINALITY] poll failed:", (err as Error).message));
+    pollFinality().catch((err) => logError("[FINALITY] poll failed:", err));
   }, FINALITY_POLL_INTERVAL_MS);
 
-  pollAwaitingSlash(reconciliationDeps).catch((err) => console.error("[SLASH] initial poll failed:", (err as Error).message));
+  pollAwaitingSlash(reconciliationDeps).catch((err) => logError("[SLASH] initial poll failed:", err));
   setInterval(() => {
-    pollAwaitingSlash(reconciliationDeps).catch((err) => console.error("[SLASH] poll failed:", (err as Error).message));
+    pollAwaitingSlash(reconciliationDeps).catch((err) => logError("[SLASH] poll failed:", err));
   }, SLASH_POLL_INTERVAL_MS);
 
   console.log("\n[Orchestrator] Listening. Waiting for intents...\n");
 }
 
 process.on("unhandledRejection", (reason) => {
-  console.error("[ERROR] Unhandled rejection (continuing):", reason);
+  logError("[ERROR] Unhandled rejection (continuing):", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("[ERROR] Uncaught exception (continuing):", err);
+  logError("[ERROR] Uncaught exception (continuing):", err);
 });
 
 main().catch((err) => {
-  console.error("[FATAL] Unhandled error during boot:", err);
+  logError("[FATAL] Unhandled error during boot:", err);
   process.exit(1);
 });

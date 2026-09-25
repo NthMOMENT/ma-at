@@ -26,7 +26,7 @@ for (const v of ["MAAT_STATE_DIR", "ALERT_LOG_PATH"]) {
 
 // Imported after the env checks above — intent_state.ts reads MAAT_STATE_DIR
 // and prover_pipeline.ts reads ALERT_LOG_PATH once, at module load.
-import { redact } from "./redact";
+import { redact, redactError } from "./redact";
 import { readState, setAlert, recordAlertReason, setRejected } from "./intent_state";
 import { alert } from "./prover_pipeline";
 
@@ -102,6 +102,26 @@ console.log("[gate-test] 6) redact() does NOT over-redact an env var NAME or an 
   check("env var name survives", envName.includes("ARBITRUM_INTENT_MANAGER_ADDRESS"));
   const idText = "intent 0x" + "dd".repeat(32) + ": ok";
   check("0x-prefixed id survives", redact(idText) === idText);
+}
+
+console.log("[gate-test] 7) redactError(): a viem-shaped Error whose message embeds a fake Alchemy URL comes out clean — this is what listener.ts's logError() (every watchContractEvent onError, every RPC catch) now passes every console.error through");
+{
+  // Mirrors the actual shape of a real viem HttpRequestError message: the
+  // full request URL embedded, API key and all.
+  const viemStyleError = new Error(
+    `HTTP request failed.\n\nURL: ${FAKE_URL_WITH_KEY}\nRequest body: {"method":"eth_getBlockByNumber"}\n\nDetails: Must be authenticated!`
+  );
+  const out = redactError(viemStyleError);
+  check("raw URL gone", !out.includes(FAKE_URL_WITH_KEY));
+  check("raw key gone", !out.includes("FAKEKEY123"));
+  check("placeholder present", out.includes("[redacted-url]"));
+  check("surrounding diagnostic text preserved", out.includes("Must be authenticated!"));
+}
+
+console.log("[gate-test] 8) redactError(): handles a non-Error thrown value too (unhandledRejection's `reason` can be anything)");
+{
+  const out = redactError(`connection reset while calling ${FAKE_URL_WITH_KEY}`);
+  check("string-thrown value also redacted", !out.includes(FAKE_URL_WITH_KEY) && out.includes("[redacted-url]"));
 }
 
 if (failures > 0) {

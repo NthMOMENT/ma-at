@@ -19,6 +19,7 @@ import { ZK_DIR, alert } from "./prover_pipeline";
 import { recordAlertReason, setArbitrumSettlement, type ArbitrumSettlementStage } from "./intent_state";
 import { setArbitrumStage, getArbitrumLedgerEntry, getMidSequenceEntries, getAwaitingExpirySlashEntries, getCollateralPostedEntries } from "./arbitrum_ledger";
 import { isAlreadySettled } from "./prover_pipeline";
+import { redact } from "./redact";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -369,7 +370,7 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
   // expiry - DELIVERY_MARGIN_SEC, then handed to the slash poller ──
   let solanaResult = await deps.runSolanaPayout();
   while (!solanaResult.ok && deps.nowSec() < json.expiry - DELIVERY_MARGIN_SEC) {
-    console.warn(`[ARB-SETTLE] intent 0x${intentIdHex}: Solana payout failed (${solanaResult.error ?? "unknown"}) — retrying in ${SOLANA_PAYOUT_RETRY_INTERVAL_MS}ms`);
+    console.warn(`[ARB-SETTLE] intent 0x${intentIdHex}: Solana payout failed (${redact(solanaResult.error ?? "unknown")}) — retrying in ${SOLANA_PAYOUT_RETRY_INTERVAL_MS}ms`);
     await sleep(SOLANA_PAYOUT_RETRY_INTERVAL_MS);
     solanaResult = await deps.runSolanaPayout();
   }
@@ -436,7 +437,7 @@ export async function confirmSettlementWithRetry(deps: ArbitrumSettlementDeps, i
       return;
     }
     const backoff = CONFIRM_RETRY_BACKOFF_MS[Math.min(attempt - 1, CONFIRM_RETRY_BACKOFF_MS.length - 1)];
-    console.warn(`[ARB-SETTLE] intent 0x${intentIdHex}: confirmSettlement attempt ${attempt} failed (${confirmOutcome.error ?? "unknown"}) — retrying in ${backoff}ms`);
+    console.warn(`[ARB-SETTLE] intent 0x${intentIdHex}: confirmSettlement attempt ${attempt} failed (${redact(confirmOutcome.error ?? "unknown")}) — retrying in ${backoff}ms`);
     await sleep(backoff);
   }
 }

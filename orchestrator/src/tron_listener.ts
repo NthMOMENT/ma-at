@@ -1,9 +1,20 @@
-import * as dotenv from "dotenv";
+// Gate 5D-fix: MUST be the first import — see listener.ts's matching comment.
+// ./intent_state below reads process.env.MAAT_STATE_DIR at module load; it
+// needs dotenv to have already run.
+import "dotenv/config";
 import { createHash } from "crypto";
 import { PublicKey } from "@solana/web3.js";
 import { recordIntentCreated } from "./intent_state";
+import { redactError } from "./redact";
 
-dotenv.config();
+// Gate 5D-fix: same reasoning as listener.ts's matching helper — every
+// TronGrid/network error passes through here before being logged. TronGrid's
+// API key travels as a header here, not URL-embedded, so the risk is lower
+// than viem's Alchemy URLs, but this costs nothing and closes the gap if
+// that ever changes.
+function logError(prefix: string, err: unknown): void {
+  console.error(prefix, redactError(err));
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 //
@@ -193,7 +204,7 @@ function logIntentCreated(ev: TronGridEvent): void {
       { kind: "skipped", chain: "TRON Nile Testnet" }
     );
   } catch (err) {
-    console.error(`[ERROR] Failed to process IntentCreated event on TRON Nile Testnet:`, err);
+    logError(`[ERROR] Failed to process IntentCreated event on TRON Nile Testnet:`, err);
   }
 }
 
@@ -213,7 +224,7 @@ function logCollateralPosted(ev: TronGridEvent): void {
     console.log(`  blockNumber:      ${ev.block_number}`);
     divider();
   } catch (err) {
-    console.error(`[ERROR] Failed to process CollateralPosted event on TRON Nile Testnet:`, err);
+    logError(`[ERROR] Failed to process CollateralPosted event on TRON Nile Testnet:`, err);
   }
 }
 
@@ -235,7 +246,7 @@ function logIntentSettled(ev: TronGridEvent): void {
     console.log(`  blockNumber: ${ev.block_number}`);
     divider();
   } catch (err) {
-    console.error(`[ERROR] Failed to process IntentSettled event on TRON Nile Testnet:`, err);
+    logError(`[ERROR] Failed to process IntentSettled event on TRON Nile Testnet:`, err);
   }
 }
 
@@ -296,7 +307,7 @@ function pollEvent(eventName: WatchedEvent, cursor: EventCursor): void {
       if (cursor.seen.size > 5000) cursor.seen.clear();
     })
     .catch((err: Error) => {
-      console.error(`[TRON Nile Testnet] ${eventName} poll error:`, err.message);
+      logError(`[TRON Nile Testnet] ${eventName} poll error:`, err);
     });
 }
 
@@ -335,7 +346,7 @@ async function main(): Promise<void> {
     const events = await fetchEvents("IntentCreated", 0);
     console.log(`[TRON Nile Testnet] Connected via TronGrid. (${events.length} historical IntentCreated event(s) seen, not replayed)`);
   } catch (err) {
-    console.error("[FATAL] Cannot reach TronGrid:", (err as Error).message);
+    logError("[FATAL] Cannot reach TronGrid:", err);
     process.exit(1);
   }
 
@@ -346,14 +357,14 @@ async function main(): Promise<void> {
 }
 
 process.on("unhandledRejection", (reason) => {
-  console.error("[ERROR] Unhandled rejection (continuing):", reason);
+  logError("[ERROR] Unhandled rejection (continuing):", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("[ERROR] Uncaught exception (continuing):", err);
+  logError("[ERROR] Uncaught exception (continuing):", err);
 });
 
 main().catch((err) => {
-  console.error("[FATAL] Unhandled error during boot:", err);
+  logError("[FATAL] Unhandled error during boot:", err);
   process.exit(1);
 });

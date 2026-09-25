@@ -234,7 +234,7 @@ function runProverProcess(txHash: string): Promise<ProverProcessResult> {
     });
     proc.on("close", (code) => resolve({ code: code ?? 1, stderrTail: stderrBuf.slice(-2000) }));
     proc.on("error", (err) => {
-      console.error(`[PROVER] failed to spawn flock/systemd-run:`, err.message);
+      console.error(`[PROVER] failed to spawn flock/systemd-run:`, redact(err.message));
       resolve({ code: 1, stderrTail: `failed to spawn flock/systemd-run: ${err.message}` }); // couldn't even start — infra, retry
     });
   });
