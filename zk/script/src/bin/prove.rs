@@ -15,6 +15,7 @@ use sp1_sdk::{include_elf, Elf, HashableKey, Prover, ProveRequest, ProverClient,
 use std::env;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const TARGET_CONTRACT: &str = "0x9D1bd7119E9FefF6Baa3968272811323B354B16f";
 // Robinhood Chain testnet IntentManager — same Solidity source, same
@@ -427,6 +428,22 @@ fn native_precheck(urls: &[String], tx_hash: &str) -> Result<ProofInput, CheckEr
     }
     if expiry <= block_timestamp {
         return Err(CheckError::Semantic(format!("intent already expired: expiry {expiry} <= block timestamp {block_timestamp}")));
+    }
+
+    // Gate 5C-check: the block_timestamp check above only catches an intent
+    // that was already expired at creation — it can never catch one that
+    // goes stale while WAITING to be proved (queued behind another ~7min
+    // job, or backed off after an infra retry). Re-check against the
+    // current wall clock, right before this input would otherwise be handed
+    // to client.setup(), so a slow-to-reach-the-front-of-the-queue intent is
+    // rejected outright instead of burning a full prove run whose result the
+    // settle gate would refuse anyway (it independently re-checks expiry).
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| CheckError::Infra(format!("system clock error: {e}")))?
+        .as_secs();
+    if expiry <= now {
+        return Err(CheckError::Semantic(format!("expired before proving: expiry {expiry} <= now {now}")));
     }
 
     // eth_trie's get_proof() silently returns an incomplete/wrong proof if
