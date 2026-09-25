@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 *.log
+state/
+settled_intents.json

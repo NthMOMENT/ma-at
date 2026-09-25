@@ -1,8 +1,7 @@
 import * as dotenv from "dotenv";
-import { spawn } from "child_process";
-import * as path from "path";
 import { createHash } from "crypto";
 import { PublicKey } from "@solana/web3.js";
+import { recordIntentCreated } from "./intent_state";
 
 dotenv.config();
 
@@ -33,11 +32,9 @@ const API_KEYS = [process.env.TRONGRID_API_KEY_1, process.env.TRONGRID_API_KEY_2
   (k): k is string => Boolean(k)
 );
 
-const POLL_INTERVAL_MS = Number(process.env.TRON_POLL_INTERVAL_MS ?? 3000);
-
-// Path to the compiled SP1 prover binary — same binary/pipeline the EVM listener drives.
-const PROVER_BINARY = process.env.PROVER_BINARY_PATH ?? path.resolve(__dirname, "../../zk/target/release/prove");
-const SETTLE_SCRIPT = process.env.SETTLE_SCRIPT_PATH ?? path.resolve(__dirname, "../settle_intent.js");
+// Decision 2 (Gate 5C briefing): TRON's default poll interval, configurable
+// via env var like the EVM listeners' ARBITRUM_POLL_INTERVAL_MS/ROBINHOOD_POLL_INTERVAL_MS.
+const POLL_INTERVAL_MS = Number(process.env.TRON_POLL_INTERVAL_MS ?? 10000);
 
 // ─── Event definitions ────────────────────────────────────────────────────────
 // Mirrors listener.ts's INTENT_MANAGER_ABI. TronGrid decodes event args by
@@ -136,108 +133,6 @@ function decodeDestinationWallet(destinationWallet: `0x${string}`, destinationCh
   return `0x${bytes.subarray(12).toString("hex")}`;
 }
 
-// ─── ZK Proof Trigger ────────────────────────────────────────────────────────
-// Identical pipeline to listener.ts's triggerZKVerification: spawn the SP1
-// prover in execute mode, and on verified:true, spawn the same Solana
-// settlement script. Duplicated here (rather than imported) since listener.ts
-// exports nothing and is left untouched.
-
-function triggerZKVerification(
-  intentId: string,
-  blockNumber: string,
-  destinationWallet: string,
-  destinationChainId: bigint
-): void {
-  console.log(`[ZK] Spawning prover for intentId: ${intentId}`);
-  console.log(`[ZK] Binary: ${PROVER_BINARY}`);
-  console.log(`[ZK] Mode: execute (instant verification)`);
-
-  const env = {
-    ...process.env,
-    SP1_PROVER: "cpu",
-  };
-
-  const prover = spawn(PROVER_BINARY, ["execute"], { env });
-
-  let stdout = "";
-  let stderr = "";
-
-  prover.stdout.on("data", (data: Buffer) => {
-    stdout += data.toString();
-  });
-
-  prover.stderr.on("data", (data: Buffer) => {
-    stderr += data.toString();
-  });
-
-  prover.on("close", (code: number) => {
-    if (code !== 0) {
-      console.error(`[ZK] Prover exited with code ${code}`);
-      if (stderr) console.error(`[ZK] stderr: ${stderr.trim()}`);
-      return;
-    }
-
-    const verifiedMatch = stdout.match(/verified:\s*(true|false)/);
-    const cyclesMatch = stdout.match(/cycles:\s*(\d+)/);
-    const vkeyMatch = stdout.match(/Verification key:\s*(0x[a-fA-F0-9]+)/);
-
-    const verified = verifiedMatch ? verifiedMatch[1] : "unknown";
-    const cycles = cyclesMatch ? cyclesMatch[1] : "unknown";
-    const vkey = vkeyMatch ? vkeyMatch[1] : "unknown";
-
-    divider();
-    console.log(`[ZK] ─── PROOF VERIFICATION COMPLETE ───`);
-    console.log(`[ZK]   intentId:  ${intentId}`);
-    console.log(`[ZK]   blockNum:  ${blockNumber}`);
-    console.log(`[ZK]   verified:  ${verified}`);
-    console.log(`[ZK]   cycles:    ${cycles}`);
-    console.log(`[ZK]   vkey:      ${vkey}`);
-    console.log(`[ZK]   status:    ${verified === "true" ? "VALID — ready for settlement" : "INVALID — intent rejected"}`);
-    divider();
-
-    if (verified === "true") {
-      console.log(`[SETTLE] ZK verified — triggering Solana settlement...`);
-      const settleEnv = {
-        ...process.env,
-        DESTINATION_WALLET: destinationWallet,
-        DESTINATION_CHAIN_ID: destinationChainId.toString(),
-      };
-      const settler = spawn("node", [SETTLE_SCRIPT], { env: settleEnv });
-      let settleOut = "";
-      let settleErr = "";
-      settler.stdout.on("data", (d: Buffer) => { settleOut += d.toString(); });
-      settler.stderr.on("data", (d: Buffer) => { settleErr += d.toString(); });
-      settler.on("close", (code: number) => {
-        if (code !== 0) {
-          console.error(`[SETTLE] Settlement failed (code ${code})`);
-          if (settleErr) console.error(`[SETTLE] ${settleErr.trim()}`);
-          return;
-        }
-        const settleTxMatch = settleOut.match(/receive_settlement tx:\s*(\S+)/);
-        const deltaMatch = settleOut.match(/Delta:\s*\+\s*([\d.]+)/);
-        const settleTx = settleTxMatch ? settleTxMatch[1] : "unknown";
-        const delta = deltaMatch ? deltaMatch[1] : "unknown";
-        divider();
-        console.log(`[SETTLE] ─── SOLANA SETTLEMENT COMPLETE ───`);
-        console.log(`[SETTLE]   intentId:   ${intentId}`);
-        console.log(`[SETTLE]   settleTx:   ${settleTx}`);
-        console.log(`[SETTLE]   delivered:  ${delta} SOL`);
-        console.log(`[SETTLE]   destination: C9CZZFbeJ2Vzj9w8ctcsYKyK4mLQNq2vvsGwPJ7uEHtd`);
-        console.log(`[SETTLE]   note: 1:1 mock rate (devnet). Pyth oracle + Jupiter routing at mainnet.`);
-        divider();
-      });
-      settler.on("error", (err: Error) => {
-        console.error(`[SETTLE] Failed to spawn settler:`, err.message);
-      });
-    }
-  });
-
-  prover.on("error", (err: Error) => {
-    console.error(`[ZK] Failed to spawn prover:`, err.message);
-    console.error(`[ZK] Is the binary at ${PROVER_BINARY}?`);
-  });
-}
-
 // ─── Event handlers ────────────────────────────────────────────────────────────
 
 function logIntentCreated(ev: TronGridEvent): void {
@@ -273,7 +168,30 @@ function logIntentCreated(ev: TronGridEvent): void {
     divider();
 
     console.log(`[ZK] IntentCreated detected — triggering ZK verification...`);
-    triggerZKVerification(intentId, String(ev.block_number), decodedDestination, destinationChainIdBig);
+    // KNOWN LIMITATION: the ZK pipeline (zk/script/src/bin/prove.rs) only
+    // proves Arbitrum Sepolia IntentManager receipts — its TARGET_CONTRACT
+    // and RPC calls are pinned to that chain, so it cannot look up a TRON
+    // tx. Rather than spawn a prover run that's guaranteed to fail against
+    // the wrong chain's RPC, skip explicitly and say why. Revisit once/if
+    // prove.rs grows multi-chain support.
+    console.log(`[ZK] skipped: no proof available for TRON Nile Testnet — ZK proving is only implemented for Arbitrum Sepolia-sourced intents right now.`);
+
+    // Gate 5C: one state record per intent, same as listener.ts's EVM side —
+    // the /proof dashboard's only data source.
+    recordIntentCreated(
+      {
+        intentId,
+        sourceChain: "TRON Nile Testnet",
+        sourceTxHash: ev.transaction_id,
+        blockNumber: ev.block_number,
+        blockHash: null, // not present on TronGrid's REST event payload
+        amountWei: amount.toString(),
+        tokenAddress,
+        destinationChainId,
+        destinationWallet: decodedDestination,
+      },
+      { kind: "skipped", chain: "TRON Nile Testnet" }
+    );
   } catch (err) {
     console.error(`[ERROR] Failed to process IntentCreated event on TRON Nile Testnet:`, err);
   }
@@ -408,9 +326,9 @@ function watchChain(): void {
 
 async function main(): Promise<void> {
   console.log("═".repeat(64));
-  console.log("  Maat Orchestrator — TRON Intent Listener + ZK Verifier");
+  console.log("  Maat Orchestrator — TRON Intent Listener");
   console.log(`  Started: ${new Date().toISOString()}`);
-  console.log(`  Prover:  ${PROVER_BINARY}`);
+  console.log(`  ZK proving: not yet implemented for this chain (Arbitrum Sepolia only — see prove.rs)`);
   console.log("═".repeat(64) + "\n");
 
   try {
