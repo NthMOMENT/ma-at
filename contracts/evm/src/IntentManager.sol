@@ -19,7 +19,8 @@ contract IntentManager is ReentrancyGuard, Pausable {
         Pending,
         Settled,
         Expired,
-        Slashed
+        Slashed,
+        Refunded
     }
 
     struct Intent {
@@ -49,11 +50,21 @@ contract IntentManager is ReentrancyGuard, Pausable {
     mapping(bytes32 => Intent) public intents;
     uint256 public intentNonce;
 
-    address public immutable orchestrator;
+    /// @dev No longer immutable (v2) — owner-rotatable via setOrchestrator so a
+    /// compromised or retiring orchestrator key can be replaced without redeploying.
+    address public orchestrator;
     address public immutable treasury;
     address public immutable owner;
 
+    /// @dev v2: solvers must be explicitly approved by owner before they may
+    /// postCollateral — replaces v1's "first caller with the right collateral wins".
+    mapping(address => bool) public approvedSolvers;
+
     uint256 public constant COLLATERAL_RATIO = 150;
+
+    /// @dev v2: grace period after expiry before the intent owner can pull the
+    /// escape hatch (claimRefund) if the orchestrator never confirms or slashes.
+    uint256 public constant REFUND_GRACE = 24 hours;
 
     uint256 public dailyVolume;
     uint256 public dailyVolumeLimit;
@@ -76,6 +87,10 @@ contract IntentManager is ReentrancyGuard, Pausable {
     event IntentCancelled(bytes32 indexed intentId, address indexed user, uint256 amount);
     event CircuitBreakerTriggered(uint256 amount, uint256 dailyVolume, uint256 dailyVolumeLimit);
     event DailyVolumeLimitUpdated(uint256 newLimit);
+    event OrchestratorChanged(address indexed previousOrchestrator, address indexed newOrchestrator);
+    event SolverApproved(address indexed solver, bool approved);
+    event CollateralReturned(bytes32 indexed intentId, address indexed solver, uint256 amount);
+    event IntentRefunded(bytes32 indexed intentId, address indexed owner, uint256 amount, uint256 collateral);
 
     error InvalidAmount();
     error ExpiryInPast();
@@ -93,6 +108,7 @@ contract IntentManager is ReentrancyGuard, Pausable {
     error NoSolver();
     error EthTransferFailed();
     error ZeroAddress();
+    error NotApprovedSolver();
 
     modifier onlyOrchestrator() {
         if (msg.sender != orchestrator) revert NotOrchestrator();
@@ -176,7 +192,10 @@ contract IntentManager is ReentrancyGuard, Pausable {
     /// intent.amount's raw token-unit count, not its ETH-equivalent value — this
     /// produces a meaningless collateral requirement across assets of differing
     /// price/decimals until real cross-asset (oracle-based) collateralization is added.
+    /// @dev v2: caller must be an owner-approved solver (see setSolver) — no longer
+    /// "first correctly-collateralized caller wins".
     function postCollateral(bytes32 intentId) external payable whenNotPaused nonReentrant {
+        if (!approvedSolvers[msg.sender]) revert NotApprovedSolver();
         Intent storage intent = intents[intentId];
         if (intent.owner == address(0)) revert IntentDoesNotExist();
         if (intent.solver != address(0)) revert SolverAlreadyPosted();
@@ -191,24 +210,33 @@ contract IntentManager is ReentrancyGuard, Pausable {
         emit CollateralPosted(intentId, msg.sender, msg.value);
     }
 
-    /// @notice Orchestrator confirms an off-chain-verified ZK proof and releases the
-    /// escrowed user funds to the solver as reimbursement/reward.
+    /// @notice Orchestrator confirms an off-chain-verified ZK proof, releases the
+    /// escrowed user funds to the solver as reimbursement/reward, and returns the
+    /// solver's posted collateral in full.
+    /// @dev v2: no expiry check — the destination-chain delivery this confirms may
+    /// have been proven after the source-chain intent's expiry passed; expiry only
+    /// gates cancelIntent/slashSolver, not a legitimate late confirmation.
     function confirmSettlement(bytes32 intentId, bytes32 zkProofHash) external onlyOrchestrator nonReentrant {
         Intent storage intent = intents[intentId];
         if (intent.status != IntentStatus.Pending) revert IntentNotPending();
-        if (block.timestamp >= intent.expiry) revert IntentExpired();
         if (intent.solver == address(0)) revert NoSolver();
 
         intent.status = IntentStatus.Settled;
         intent.zkProofHash = zkProofHash;
         intent.settledAt = block.timestamp;
 
-        uint256 amount = intent.amount;
         address solver = intent.solver;
+        uint256 amount = intent.amount;
+        uint256 collateral = intent.collateralPosted;
+        intent.collateralPosted = 0;
 
         _releaseFunds(solver, amount, intent.tokenAddress);
 
+        (bool ok,) = payable(solver).call{value: collateral}("");
+        if (!ok) revert EthTransferFailed();
+
         emit IntentSettled(intentId, solver, amount, zkProofHash);
+        emit CollateralReturned(intentId, solver, collateral);
     }
 
     /// @notice Orchestrator slashes a solver that failed to deliver before expiry.
@@ -224,6 +252,7 @@ contract IntentManager is ReentrancyGuard, Pausable {
         address user = intent.owner;
         uint256 amount = intent.amount;
         uint256 collateral = intent.collateralPosted;
+        intent.collateralPosted = 0;
 
         _releaseFunds(user, amount, intent.tokenAddress);
 
@@ -248,6 +277,32 @@ contract IntentManager is ReentrancyGuard, Pausable {
         _releaseFunds(msg.sender, amount, intent.tokenAddress);
 
         emit IntentCancelled(intentId, msg.sender, amount);
+    }
+
+    /// @notice Escape hatch for an intent a solver collateralized but the
+    /// orchestrator never confirmed or slashed, even REFUND_GRACE after expiry —
+    /// covers an orchestrator that's down, buggy, or has simply abandoned the
+    /// intent. Refunds escrow to the owner and forfeits the solver's collateral
+    /// to treasury, same disposition as slashSolver.
+    /// @dev Not whenNotPaused: a pause must never trap user funds.
+    function claimRefund(bytes32 intentId) external nonReentrant {
+        Intent storage intent = intents[intentId];
+        if (intent.owner != msg.sender) revert NotIntentOwner();
+        if (intent.status != IntentStatus.Pending) revert IntentNotPending();
+        if (intent.solver == address(0)) revert NoSolver();
+        if (block.timestamp < intent.expiry + REFUND_GRACE) revert IntentNotExpired();
+
+        intent.status = IntentStatus.Refunded;
+        uint256 amount = intent.amount;
+        uint256 collateral = intent.collateralPosted;
+        intent.collateralPosted = 0;
+
+        _releaseFunds(msg.sender, amount, intent.tokenAddress);
+
+        (bool okTreasury,) = payable(treasury).call{value: collateral}("");
+        if (!okTreasury) revert EthTransferFailed();
+
+        emit IntentRefunded(intentId, msg.sender, amount, collateral);
     }
 
     /// @dev Releases an intent's escrowed `amount` — native ETH if tokenAddress is
@@ -275,5 +330,21 @@ contract IntentManager is ReentrancyGuard, Pausable {
     function setDailyVolumeLimit(uint256 newLimit) external onlyAdmin {
         dailyVolumeLimit = newLimit;
         emit DailyVolumeLimitUpdated(newLimit);
+    }
+
+    /// @notice Rotates the orchestrator role. The previous orchestrator loses all
+    /// rights (confirmSettlement/slashSolver) the moment this call lands.
+    function setOrchestrator(address newOrchestrator) external onlyAdmin {
+        if (newOrchestrator == address(0)) revert ZeroAddress();
+        address previous = orchestrator;
+        orchestrator = newOrchestrator;
+        emit OrchestratorChanged(previous, newOrchestrator);
+    }
+
+    /// @notice Approves or revokes a solver's ability to call postCollateral.
+    function setSolver(address solver, bool approved) external onlyAdmin {
+        if (solver == address(0)) revert ZeroAddress();
+        approvedSolvers[solver] = approved;
+        emit SolverApproved(solver, approved);
     }
 }
