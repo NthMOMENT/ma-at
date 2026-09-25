@@ -222,7 +222,11 @@ export interface ArbitrumSettlementDeps {
   postCollateral(intentId: `0x${string}`, valueWei: bigint, onSigned: (hash: `0x${string}`) => void): Promise<TxOutcome>;
   confirmSettlement(intentId: `0x${string}`, zkProofHash: `0x${string}`, onSigned: (hash: `0x${string}`) => void): Promise<TxOutcome>;
   slashSolver(intentId: `0x${string}`, onSigned: (hash: `0x${string}`) => void): Promise<TxOutcome>;
-  runSolanaPayout(): Promise<SolanaPayoutResult>;
+  /** Gate 5D-vkey: zkProofHash is the SAME value (computeZkProofHash's
+   *  output, computed once by the caller) that confirmSettlement below
+   *  sends to Arbitrum — one source of truth for both legs, never
+   *  recomputed independently on the Solana side. */
+  runSolanaPayout(zkProofHash: `0x${string}`): Promise<SolanaPayoutResult>;
   nowSec(): number;
 }
 
@@ -253,7 +257,11 @@ async function signAndSend(
   }
 }
 
-export function buildRealDeps(publicClient: PublicClient, intentManagerAddress: `0x${string}`, runSolanaPayout: () => Promise<SolanaPayoutResult>): ArbitrumSettlementDeps {
+export function buildRealDeps(
+  publicClient: PublicClient,
+  intentManagerAddress: `0x${string}`,
+  runSolanaPayout: (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult>
+): ArbitrumSettlementDeps {
   return {
     solverAddress: solverAccount.address,
     orchestratorAddress: orchestratorAccount.address,
@@ -366,13 +374,21 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
     return;
   }
 
+  // Gate 5D-vkey: computed ONCE here and threaded through both legs below —
+  // the Solana settlement (via deps.runSolanaPayout) and the Arbitrum
+  // confirmSettlement call — so they always commit to the identical hash
+  // for this intent, rather than each independently deriving (or, as
+  // settle_intent.js used to, hardcoding) their own.
+  const zkProofHash = computeZkProofHash(intentIdHex);
+  console.log(`[ARB-SETTLE] intent 0x${intentIdHex}: zkProofHash for both legs = ${zkProofHash}`);
+
   // ── Step 3: Solana payout (existing flow, unchanged) — retried until
   // expiry - DELIVERY_MARGIN_SEC, then handed to the slash poller ──
-  let solanaResult = await deps.runSolanaPayout();
+  let solanaResult = await deps.runSolanaPayout(zkProofHash);
   while (!solanaResult.ok && deps.nowSec() < json.expiry - DELIVERY_MARGIN_SEC) {
     console.warn(`[ARB-SETTLE] intent 0x${intentIdHex}: Solana payout failed (${redact(solanaResult.error ?? "unknown")}) — retrying in ${SOLANA_PAYOUT_RETRY_INTERVAL_MS}ms`);
     await sleep(SOLANA_PAYOUT_RETRY_INTERVAL_MS);
-    solanaResult = await deps.runSolanaPayout();
+    solanaResult = await deps.runSolanaPayout(zkProofHash);
   }
 
   if (!solanaResult.ok) {
@@ -385,7 +401,7 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
   }
 
   // ── Step 4: confirmSettlement, retried with backoff ──
-  await confirmSettlementWithRetry(deps, intentId, json);
+  await confirmSettlementWithRetry(deps, intentId, json, zkProofHash);
 }
 
 /// Retries confirmSettlement with backoff (1, 5, 15, 30 min, then every 30
@@ -398,9 +414,14 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
 /// confirmed it) — mark confirmed and stop, never re-send. Slashed/Refunded
 /// means someone/something else already resolved this intent — stop and
 /// alert rather than attempting a confirmSettlement that can only revert.
-export async function confirmSettlementWithRetry(deps: ArbitrumSettlementDeps, intentId: `0x${string}`, json: ProofOutputJson): Promise<void> {
+export async function confirmSettlementWithRetry(
+  deps: ArbitrumSettlementDeps,
+  intentId: `0x${string}`,
+  json: ProofOutputJson,
+  zkProofHash: `0x${string}`
+): Promise<void> {
   const intentIdHex = intentId.replace(/^0x/i, "").toLowerCase();
-  const zkProofHash = computeZkProofHash(intentIdHex);
+  console.log(`[ARB-SETTLE] intent 0x${intentIdHex}: confirming with zkProofHash ${zkProofHash}`);
   const deadline = json.expiry + CONFIRM_RETRY_MAX_SEC_AFTER_EXPIRY;
 
   for (let attempt = 1; ; attempt++) {

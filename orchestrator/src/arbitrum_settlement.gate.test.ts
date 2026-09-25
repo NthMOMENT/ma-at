@@ -52,6 +52,7 @@ for (const v of [
 // once, at load time.
 import {
   evaluateArbitrumGate,
+  computeZkProofHash,
   runArbitrumSettlementSequence,
   confirmSettlementWithRetry,
   pollAwaitingSlash,
@@ -81,6 +82,7 @@ function check(name: string, cond: boolean): void {
 const SOLVER = "0x00000000000000000000000000000000000501" as `0x${string}`;
 const OTHER_SOLVER = "0x00000000000000000000000000000000000502" as `0x${string}`;
 const ORCHESTRATOR = "0x00000000000000000000000000000000000601" as `0x${string}`;
+const FAKE_ZK_PROOF_HASH = ("0x" + "77".repeat(32)) as `0x${string}`;
 
 function baseJson(intentIdHex: string, overrides: Partial<ProofOutputJson> = {}): ProofOutputJson {
   return {
@@ -271,6 +273,7 @@ async function main(): Promise<void> {
   {
     const intentIdHex = "0b".repeat(32);
     const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    writeFakeProofBin(intentIdHex); // computeZkProofHash now runs before Step 3, same as Step 4
     const fakeNow = Math.floor(Date.now() / 1000);
     // deadline = expiry - margin = fakeNow + 700 - 600 = fakeNow + 100.
     const json = baseJson(intentIdHex, { expiry: fakeNow + 700 });
@@ -352,7 +355,7 @@ async function main(): Promise<void> {
         return { ok: true, txHash: ("0x" + "bb".repeat(32)) as `0x${string}` };
       },
     });
-    await confirmSettlementWithRetry(deps, intentId, json);
+    await confirmSettlementWithRetry(deps, intentId, json, FAKE_ZK_PROOF_HASH);
     check("retried exactly once before succeeding", attempts === 2);
     const entry = getArbitrumLedgerEntry(intentId);
     check("ledger stage is confirmed", entry?.stage === "confirmed");
@@ -384,7 +387,7 @@ async function main(): Promise<void> {
         return { ok: false, txHash: ("0x" + "cc".repeat(32)) as `0x${string}`, error: "reverted" };
       },
     });
-    await confirmSettlementWithRetry(deps, intentId, json);
+    await confirmSettlementWithRetry(deps, intentId, json, FAKE_ZK_PROOF_HASH);
     check("confirmSettlement attempted exactly once (stopped before a 2nd attempt)", confirmCalls === 1);
     check("ledger stage marked confirmed from the on-chain check, not a successful tx", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
   }
@@ -408,7 +411,7 @@ async function main(): Promise<void> {
         return { ok: false, txHash: ("0x" + "dd".repeat(32)) as `0x${string}`, error: "reverted" };
       },
     });
-    await confirmSettlementWithRetry(deps, intentId, json);
+    await confirmSettlementWithRetry(deps, intentId, json, FAKE_ZK_PROOF_HASH);
     check("confirmSettlement attempted exactly once (stopped before a 2nd attempt)", confirmCalls === 1);
     check("ledger did not get marked confirmed (Refunded, not Settled)", getArbitrumLedgerEntry(intentId)?.stage !== "confirmed");
     check("state alertReason set", !!readState(intentId)?.alertReason?.includes("Refunded"));
@@ -538,6 +541,33 @@ async function main(): Promise<void> {
     const deps = baseDeps({ readIntent: async () => mockOnChainIntent({ status: INTENT_STATUS_SLASHED }) });
     await reconcileArbitrumLedger(deps, fakePublicClient);
     check("ledger stage is slashed", getArbitrumLedgerEntry(intentId)?.stage === "slashed");
+  }
+
+  console.log("[gate-test] 22) runArbitrumSettlementSequence: the SAME zkProofHash (computeZkProofHash's output on the real fixture proof file) reaches BOTH the Solana leg and confirmSettlement — Gate 5D-vkey's one-source-of-truth requirement");
+  {
+    const intentIdHex = "19".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    const expectedHash = computeZkProofHash(intentIdHex);
+
+    let solanaLegHash: `0x${string}` | undefined;
+    let confirmLegHash: `0x${string}` | undefined;
+    const deps = baseDeps({
+      runSolanaPayout: async (zkProofHash) => {
+        solanaLegHash = zkProofHash;
+        return { ok: true, sig: "solana-sig-1" };
+      },
+      confirmSettlement: async (_id, zkProofHash, onSigned) => {
+        confirmLegHash = zkProofHash;
+        onSigned(("0x" + "88".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "88".repeat(32)) as `0x${string}` };
+      },
+    });
+    await runArbitrumSettlementSequence(deps, intentId, json);
+    check("Solana leg received computeZkProofHash's real output", solanaLegHash === expectedHash);
+    check("confirmSettlement leg received the SAME computeZkProofHash output", confirmLegHash === expectedHash);
+    check("both legs received an identical hash (never independently derived)", solanaLegHash === confirmLegHash);
   }
 
   if (failures > 0) {

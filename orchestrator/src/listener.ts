@@ -305,7 +305,7 @@ function triggerZKVerification(
     const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
 
     console.log(`[SETTLE] all gate checks passed — running Arbitrum settlement sequence (postCollateral -> Solana payout -> confirmSettlement/slashSolver)...`);
-    const deps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, () => runSolanaPayout(intentId, json, payoutDestination));
+    const deps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash));
     await runArbitrumSettlementSequence(deps, json.intent_id as `0x${string}`, json);
   });
 }
@@ -317,7 +317,7 @@ function triggerZKVerification(
 /// reported back via the return value, NOT alert()'d here — the caller
 /// alerts once, after its own retry-until-deadline loop gives up, so a
 /// transient failure during retries doesn't spam alerts.log every attempt.
-async function runSolanaPayout(intentId: string, json: ProofOutputJson, payoutDestination: string): Promise<SolanaPayoutResult> {
+async function runSolanaPayout(intentId: string, json: ProofOutputJson, payoutDestination: string, zkProofHash: `0x${string}`): Promise<SolanaPayoutResult> {
   // Fix 6/8 (Gate 5B-fix), preserved: a settle already recorded "settled"
   // means a previous attempt (this run or a prior crashed one) already paid
   // out — report success without re-spawning. "settling" means a
@@ -336,6 +336,10 @@ async function runSolanaPayout(intentId: string, json: ProofOutputJson, payoutDe
     DESTINATION_CHAIN_ID: json.destination_chain_id.toString(),
     PROOF_AMOUNT_WEI: json.amount,
     INTENT_ID: json.intent_id,
+    // Gate 5D-vkey: the same hash confirmSettlement sends to Arbitrum for
+    // this intent — see arbitrum_settlement.ts's runArbitrumSettlementSequence,
+    // which computes this once and passes it to both legs.
+    PROOF_HASH_HEX: zkProofHash,
   };
 
   return new Promise<SolanaPayoutResult>((resolve) => {

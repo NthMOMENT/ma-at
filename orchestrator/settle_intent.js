@@ -17,7 +17,21 @@ function weiToLamports(weiStr) {
   return BigInt(weiStr) / 1_000_000_000n;
 }
 
-module.exports = { weiToLamports };
+// Gate 5D-vkey: normalizes PROOF_HASH_HEX — the sha256(proof_<id>.bin) the
+// orchestrator computes via computeZkProofHash (arbitrum_settlement.ts) and
+// passes in via env, the SAME value it sends to confirmSettlement on
+// Arbitrum. Accepts an optional "0x" prefix; requires exactly 64 hex chars
+// (32 bytes) after stripping it. Returns a lowercase, unprefixed 64-char hex
+// string, or null if the input isn't a valid 32-byte hex value — never
+// guesses or falls back to a placeholder.
+function normalizeProofHashHex(input) {
+  if (typeof input !== 'string') return null;
+  const stripped = input.startsWith('0x') || input.startsWith('0X') ? input.slice(2) : input;
+  if (!/^[0-9a-fA-F]{64}$/.test(stripped)) return null;
+  return stripped.toLowerCase();
+}
+
+module.exports = { weiToLamports, normalizeProofHashHex };
 
 // Everything below only runs when this file is executed directly (`node
 // settle_intent.js`), never on require() — e.g. from a test importing
@@ -100,11 +114,21 @@ async function runSettlement() {
   // Arbitrum Sepolia source chain ID
   const SOURCE_CHAIN_ID = new anchor.BN(421614);
 
-  // ZK proof hash from our verified intent
-  const ZK_PROOF_HASH = Buffer.from(
-    '007500eb44bf57ff9ed9585585e438b3f57e4285c578b61df832eb9fd4fd32e3',
-    'hex'
-  );
+  // Gate 5D-vkey: the retired-vkey literal that used to live here was WRONG
+  // on every single settlement — it never varied per intent, so every
+  // Solana-side proof hash was identical regardless of which intent actually
+  // settled. PROOF_HASH_HEX comes from the orchestrator's
+  // computeZkProofHash(intentIdHex) (arbitrum_settlement.ts) — the exact
+  // same sha256(proof_<id>.bin) value confirmSettlement sends to Arbitrum —
+  // so both legs commit to the same hash for the same intent. Refuses to run
+  // rather than guess, same as PROOF_AMOUNT_WEI above.
+  const PROOF_HASH_HEX = normalizeProofHashHex(process.env.PROOF_HASH_HEX);
+  if (!PROOF_HASH_HEX) {
+    console.error('[SETTLE] PROOF_HASH_HEX missing or not a valid 32-byte (64 hex char) value — refusing to settle with an unknown/wrong proof hash.');
+    process.exit(1);
+  }
+  const ZK_PROOF_HASH = Buffer.from(PROOF_HASH_HEX, 'hex');
+  console.log('[SETTLE] ZK proof hash:', PROOF_HASH_HEX);
 
   const keypairData = JSON.parse(fs.readFileSync(HOT_WALLET_PATH));
   const hotWallet = Keypair.fromSecretKey(Uint8Array.from(keypairData));
