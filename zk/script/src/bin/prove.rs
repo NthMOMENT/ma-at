@@ -17,10 +17,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const TARGET_CONTRACT: &str = "0x9D1bd7119E9FefF6Baa3968272811323B354B16f";
+// Phase 7: no hardcoded fallback — ARBITRUM_INTENT_MANAGER_ADDRESS is read
+// from the environment at startup via intent_manager_address() below and
+// fails fast if unset. There's no "safe default" contract address for a v2
+// deployment to fall back to.
+//
 // Robinhood Chain testnet IntentManager — same Solidity source, same
-// IntentCreated signature/topic0, different address. Used for the
-// --tamper=different-contract negative test.
+// IntentCreated signature/topic0, different address. Test fixture only, used
+// for the --tamper=different-contract negative test — not read from the
+// environment.
 const OTHER_REAL_CONTRACT: &str = "0xcA6bf2D574209D49515a9Eeb61E27924edE28860";
 const INTENT_CREATED_TOPIC0: &str = "0x1633e7e54ae0b855365938679d6532826f20b065ed71f076c885b24249decd99";
 // Solana chain id this deployment settles to. NOT enforced inside the zkVM
@@ -199,9 +204,34 @@ fn rpc_urls() -> Result<Vec<String>> {
     Ok(urls)
 }
 
+/// Phase 7: the one required source of the IntentManager address — no
+/// hardcoded fallback. Fails fast (infra-style) if unset or empty.
+fn intent_manager_address() -> Result<String> {
+    let v = env::var("ARBITRUM_INTENT_MANAGER_ADDRESS")
+        .map_err(|_| anyhow!("ARBITRUM_INTENT_MANAGER_ADDRESS is not set — refusing to guess a contract address"))?;
+    if v.is_empty() {
+        return Err(anyhow!("ARBITRUM_INTENT_MANAGER_ADDRESS is set but empty"));
+    }
+    Ok(v)
+}
+
 fn rpc_call_one(rpc_url: &str, method: &str, params: &Value) -> Result<Value> {
     let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let resp = reqwest::blocking::Client::new().post(rpc_url).json(&body).send()?.json::<Value>()?;
+    // .without_url() on both fallible steps: reqwest::Error's Display
+    // otherwise embeds the request URL verbatim (e.g. "error sending request
+    // for url (https://arb-sepolia.g.alchemy.com/v2/<key>): ..."), and that
+    // URL — API key and all — is exactly what ALCHEMY_RPC_URL_1/2/3 hold.
+    // This error is printed (rpc_call's eprintln below) and, since Phase 7,
+    // can flow into alertReason -> alerts.log / state file / API responses —
+    // stripped here, at the one place the URL first enters an error, rather
+    // than trusted to be redacted correctly by everything downstream.
+    let resp = reqwest::blocking::Client::new()
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .map_err(|e| anyhow!("{}", e.without_url()))?
+        .json::<Value>()
+        .map_err(|e| anyhow!("{}", e.without_url()))?;
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("RPC error on {method}: {err}"));
     }
@@ -310,7 +340,7 @@ fn encode_receipt(receipt: &Value) -> Result<Vec<u8>> {
 /// Every early return is classified Infra (RPC/proof-construction trouble —
 /// transient, worth retrying) or Semantic (the intent itself is bad — never
 /// worth retrying), matching prove.rs's exit codes 1 and 2.
-fn native_precheck(urls: &[String], tx_hash: &str) -> Result<ProofInput, CheckError> {
+fn native_precheck(urls: &[String], tx_hash: &str, target_contract: &str) -> Result<ProofInput, CheckError> {
     let tx = rpc_call(urls, "eth_getTransactionByHash", serde_json::json!([tx_hash]))
         .map_err(|e| CheckError::Infra(format!("failed to fetch tx {tx_hash}: {e}")))?;
     if tx.is_null() {
@@ -389,7 +419,7 @@ fn native_precheck(urls: &[String], tx_hash: &str) -> Result<ProofInput, CheckEr
         .iter()
         .enumerate()
         .filter(|(_, l)| {
-            let addr_match = l["address"].as_str().map(|a| a.to_lowercase()) == Some(TARGET_CONTRACT.to_lowercase());
+            let addr_match = l["address"].as_str().map(|a| a.to_lowercase()) == Some(target_contract.to_lowercase());
             let topic0_match =
                 l["topics"].get(0).and_then(Value::as_str).map(|t| t.to_lowercase()) == Some(INTENT_CREATED_TOPIC0.to_lowercase());
             addr_match && topic0_match
@@ -399,7 +429,7 @@ fn native_precheck(urls: &[String], tx_hash: &str) -> Result<ProofInput, CheckEr
     let log_pos = match matches.len() {
         0 => {
             return Err(CheckError::Semantic(format!(
-                "no IntentCreated log found (emitter == {TARGET_CONTRACT} && topic0 == IntentCreated) in this tx's receipt"
+                "no IntentCreated log found (emitter == {target_contract} && topic0 == IntentCreated) in this tx's receipt"
             )))
         }
         // KNOWN LIMITATION: a tx that emits more than one IntentCreated log
@@ -462,8 +492,8 @@ fn native_precheck(urls: &[String], tx_hash: &str) -> Result<ProofInput, CheckEr
         receipt_proof_nodes: proof,
         tx_index,
         log_index,
-        expected_contract: h2b20(TARGET_CONTRACT)
-            .map_err(|e| CheckError::Infra(format!("bad TARGET_CONTRACT constant: {e}")))?,
+        expected_contract: h2b20(target_contract)
+            .map_err(|e| CheckError::Infra(format!("bad ARBITRUM_INTENT_MANAGER_ADDRESS value: {e}")))?,
     })
 }
 
@@ -535,9 +565,16 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
+    let target_contract = match intent_manager_address() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[maat-zk] PRE-CHECK FAILED (infra): {e}");
+            std::process::exit(1);
+        }
+    };
 
-    println!("[maat-zk] Building input from tx {tx_hash}...");
-    let mut input = match native_precheck(&urls, &tx_hash) {
+    println!("[maat-zk] Building input from tx {tx_hash} (target contract {target_contract})...");
+    let mut input = match native_precheck(&urls, &tx_hash, &target_contract) {
         Ok(input) => input,
         Err(e) => {
             eprintln!("[maat-zk] PRE-CHECK FAILED ({}): {}", e.kind(), e);

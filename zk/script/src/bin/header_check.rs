@@ -13,7 +13,9 @@ use sha3::{Digest, Keccak256};
 use std::env;
 use std::sync::Arc;
 
-const TARGET_CONTRACT: &str = "0x9D1bd7119E9FefF6Baa3968272811323B354B16f";
+// Phase 7: no hardcoded fallback — read from ARBITRUM_INTENT_MANAGER_ADDRESS
+// via intent_manager_address() below, fails fast if unset.
+const INTENT_CREATED_TOPIC0: &str = "0x1633e7e54ae0b855365938679d6532826f20b065ed71f076c885b24249decd99";
 
 fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
@@ -47,6 +49,17 @@ fn rpc_urls() -> Result<Vec<String>> {
         return Err(anyhow!("no ALCHEMY_RPC_URL_1/2/3 set in .env"));
     }
     Ok(urls)
+}
+
+/// Phase 7: the one required source of the IntentManager address — no
+/// hardcoded fallback. Fails fast if unset or empty.
+fn intent_manager_address() -> Result<String> {
+    let v = env::var("ARBITRUM_INTENT_MANAGER_ADDRESS")
+        .map_err(|_| anyhow!("ARBITRUM_INTENT_MANAGER_ADDRESS is not set — refusing to guess a contract address"))?;
+    if v.is_empty() {
+        return Err(anyhow!("ARBITRUM_INTENT_MANAGER_ADDRESS is set but empty"));
+    }
+    Ok(v)
 }
 
 fn rpc_call_one(rpc_url: &str, method: &str, params: &Value) -> Result<Value> {
@@ -182,8 +195,10 @@ fn get_block_receipts(urls: &[String], block_number: &str, block: &Value) -> Res
 fn main() -> Result<()> {
     dotenv().ok();
 
+    let target_contract = intent_manager_address()?;
     let urls = rpc_urls()?;
     println!("[header_check] {} RPC URL(s) configured for rotation", urls.len());
+    println!("[header_check] target contract: {target_contract}");
 
     let tx_hash = env::args()
         .nth(1)
@@ -191,12 +206,13 @@ fn main() -> Result<()> {
 
     println!("[header_check] tx: {tx_hash}");
 
-    // ── Fetch the tx to find its block + index, and sanity-check it hit our contract ──
+    // ── Fetch the tx to find its block + index ──
+    // Deliberately NOT checking tx.to here (see CHECK 4 below, which mirrors
+    // the zkVM's own log-based check instead): a valid intent can arrive via
+    // a smart wallet, an ERC-4337 bundler, or an agent smart account, any of
+    // which make tx.to != IntentManager while still emitting a real
+    // IntentCreated log from IntentManager somewhere in the receipt.
     let tx = rpc_call(&urls, "eth_getTransactionByHash", serde_json::json!([tx_hash]))?;
-    let to = tx["to"].as_str().unwrap_or("").to_lowercase();
-    if to != TARGET_CONTRACT.to_lowercase() {
-        return Err(anyhow!("tx.to ({to}) != target contract ({TARGET_CONTRACT})"));
-    }
     let block_number = tx["blockNumber"].as_str().ok_or_else(|| anyhow!("no blockNumber"))?.to_string();
     let tx_index = u64::from_str_radix(
         tx["transactionIndex"].as_str().ok_or_else(|| anyhow!("no transactionIndex"))?.trim_start_matches("0x"),
@@ -263,10 +279,24 @@ fn main() -> Result<()> {
     let check3 = verified_value.as_deref() == Some(target_value.as_slice());
     println!("[CHECK 3] merkle proof verifies to our tx's receipt: {}", if check3 { "PASS" } else { "FAIL" });
 
-    println!();
-    println!("SUMMARY  check1={}  check2={}  check3={}", check1, check2, check3);
+    // ── CHECK 4: log-based contract match (mirrors the zkVM's own check —
+    // see the comment above where tx.to used to be checked) ──
+    let logs = target_receipt["logs"].as_array().ok_or_else(|| anyhow!("target receipt has no logs array"))?;
+    let check4 = logs.iter().any(|l| {
+        let addr_match = l["address"].as_str().map(|a| a.to_lowercase()) == Some(target_contract.to_lowercase());
+        let topic0_match =
+            l["topics"].get(0).and_then(Value::as_str).map(|t| t.to_lowercase()) == Some(INTENT_CREATED_TOPIC0.to_lowercase());
+        addr_match && topic0_match
+    });
+    println!(
+        "[CHECK 4] IntentCreated log found (emitter == {target_contract} && topic0 == IntentCreated): {}",
+        if check4 { "PASS" } else { "FAIL" }
+    );
 
-    if check1 && check2 && check3 {
+    println!();
+    println!("SUMMARY  check1={}  check2={}  check3={}  check4={}", check1, check2, check3, check4);
+
+    if check1 && check2 && check3 && check4 {
         Ok(())
     } else {
         Err(anyhow!("one or more checks failed"))
