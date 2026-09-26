@@ -8,6 +8,7 @@ use alloy_primitives::B256;
 use anyhow::{anyhow, Result};
 use dotenv::dotenv;
 use eth_trie::{EthTrie, MemoryDB, Trie};
+use maat_zk_script::rpc_rotation;
 use serde_json::Value;
 use sha3::{Digest, Keccak256};
 use std::env;
@@ -79,15 +80,20 @@ fn rpc_call_one(rpc_url: &str, method: &str, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("no result for {method}: {resp}"))
 }
 
-/// Tries each configured RPC URL in order, falling through to the next one
-/// on any error (rate limit, timeout, etc.) instead of failing outright.
+/// Tries each configured RPC URL in rpc_rotation's rotation order (skipping
+/// any still cooling down from a prior monthly-capacity/429 error — see
+/// zk/script/src/rpc_rotation.rs), falling through to the next one on any
+/// error (rate limit, timeout, etc.) instead of failing outright.
 fn rpc_call(urls: &[String], method: &str, params: Value) -> Result<Value> {
     let mut last_err = None;
-    for (i, url) in urls.iter().enumerate() {
-        match rpc_call_one(url, method, &params) {
+    for i in rpc_rotation::rotation_order(urls.len()) {
+        match rpc_call_one(&urls[i], method, &params) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 eprintln!("[rpc] {method} failed on URL_{} ({e}); trying next", i + 1);
+                if rpc_rotation::is_capacity_error(&e.to_string()) {
+                    rpc_rotation::record_capacity_error(i);
+                }
                 last_err = Some(e);
             }
         }

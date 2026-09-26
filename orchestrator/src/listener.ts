@@ -43,6 +43,7 @@ import {
 } from "./intent_state";
 import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, type SolanaPayoutResult } from "./arbitrum_settlement";
 import { redactError } from "./redact";
+import { createRotatingHttpTransport } from "./rpc_rotation";
 
 // Gate 5D-fix: every viem watcher/transport error must pass through here
 // before being logged — a viem HTTP transport error's message embeds the
@@ -65,9 +66,12 @@ const ARBITRUM_INTENT_MANAGER_ADDRESS_RAW = process.env.ARBITRUM_INTENT_MANAGER_
 const ROBINHOOD_INTENT_MANAGER_ADDRESS = (process.env.ROBINHOOD_INTENT_MANAGER_ADDRESS ??
   "0xcA6bf2D574209D49515a9Eeb61E27924edE28860") as `0x${string}`;
 
-// Three separate Alchemy app keys, tried in order (URL_1 -> URL_2 -> URL_3) —
-// mirrors zk/script's rpc_urls() in prove.rs/header_check.rs exactly, so one
-// key hitting its monthly cap doesn't take the whole pipeline down.
+// Three separate Alchemy app keys — fed to createRotatingHttpTransport
+// (./rpc_rotation), which rotates round-robin and skips whichever key is
+// mid-cooldown from a monthly-capacity/429 error, so one key hitting its cap
+// doesn't take the whole pipeline down. Mirrors zk/script's rpc_rotation.rs
+// (prove.rs/header_check.rs), file-backed there since each run is a fresh
+// process.
 const ALCHEMY_RPC_URLS = [process.env.ALCHEMY_RPC_URL_1, process.env.ALCHEMY_RPC_URL_2, process.env.ALCHEMY_RPC_URL_3].filter(
   (u): u is string => Boolean(u && u.length > 0)
 );
@@ -196,7 +200,7 @@ const INTENT_MANAGER_ABI = [INTENT_CREATED_EVENT, COLLATERAL_POSTED_EVENT, INTEN
 
 const arbClient = createPublicClient({
   chain: arbitrumSepolia,
-  transport: fallback(ALCHEMY_RPC_URLS.map((u) => http(u))),
+  transport: createRotatingHttpTransport(ALCHEMY_RPC_URLS, "Arbitrum"),
   pollingInterval: ARBITRUM_POLL_INTERVAL_MS,
 });
 

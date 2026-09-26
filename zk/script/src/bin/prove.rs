@@ -9,6 +9,7 @@
 use anyhow::{anyhow, Result};
 use dotenv::dotenv;
 use eth_trie::{EthTrie, MemoryDB, Trie};
+use maat_zk_script::rpc_rotation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sp1_sdk::{include_elf, Elf, HashableKey, Prover, ProveRequest, ProverClient, ProvingKey, SP1Stdin};
@@ -238,13 +239,20 @@ fn rpc_call_one(rpc_url: &str, method: &str, params: &Value) -> Result<Value> {
     resp.get("result").cloned().ok_or_else(|| anyhow!("no result for {method}: {resp}"))
 }
 
+/// Tries each URL in rpc_rotation's rotation order (skipping any still
+/// cooling down from a prior monthly-capacity/429 error — see
+/// zk/script/src/rpc_rotation.rs), falling through to the next one on any
+/// error, same as before.
 fn rpc_call(urls: &[String], method: &str, params: Value) -> Result<Value> {
     let mut last_err = None;
-    for (i, url) in urls.iter().enumerate() {
-        match rpc_call_one(url, method, &params) {
+    for i in rpc_rotation::rotation_order(urls.len()) {
+        match rpc_call_one(&urls[i], method, &params) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 eprintln!("[rpc] {method} failed on URL_{} ({e}); trying next", i + 1);
+                if rpc_rotation::is_capacity_error(&e.to_string()) {
+                    rpc_rotation::record_capacity_error(i);
+                }
                 last_err = Some(e);
             }
         }

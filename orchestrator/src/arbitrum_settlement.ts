@@ -7,7 +7,7 @@
 // orchestration itself (runArbitrumSettlementSequence) is deps-injected so
 // the state machine — every transition, every crash point, every tx revert —
 // is unit-testable without a live chain. See arbitrum_settlement.gate.test.ts.
-import { createWalletClient, encodeFunctionData, fallback, http, keccak256, type Hex } from "viem";
+import { createWalletClient, encodeFunctionData, keccak256, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arbitrumSepolia } from "viem/chains";
 import * as fs from "fs";
@@ -20,6 +20,7 @@ import { recordAlertReason, setArbitrumSettlement, type ArbitrumSettlementStage 
 import { setArbitrumStage, getArbitrumLedgerEntry, getMidSequenceEntries, getAwaitingExpirySlashEntries, getCollateralPostedEntries } from "./arbitrum_ledger";
 import { isAlreadySettled, readProofJson } from "./prover_pipeline";
 import { redact } from "./redact";
+import { createRotatingHttpTransport } from "./rpc_rotation";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -86,7 +87,7 @@ const orchestratorAccount = privateKeyToAccount(requiredPrivateKeyEnv("ARBITRUM_
 console.log(`[ARB-SETTLE] solver address:       ${solverAccount.address}`);
 console.log(`[ARB-SETTLE] orchestrator address: ${orchestratorAccount.address}`);
 
-const transport = fallback(ALCHEMY_RPC_URLS.map((u) => http(u)));
+const transport = createRotatingHttpTransport(ALCHEMY_RPC_URLS, "Arbitrum-settle");
 const solverWalletClient = createWalletClient({ account: solverAccount, chain: arbitrumSepolia, transport });
 const orchestratorWalletClient = createWalletClient({ account: orchestratorAccount, chain: arbitrumSepolia, transport });
 
