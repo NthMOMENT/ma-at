@@ -212,10 +212,18 @@ const rhClient = createPublicClient({
   pollingInterval: ROBINHOOD_POLL_INTERVAL_MS,
 });
 
-// Deps for boot reconciliation and the slash poller — neither ever calls
-// runSolanaPayout (only runArbitrumSettlementSequence, built fresh per
-// intent in triggerZKVerification, does), so this stub throws loudly rather
-// than silently doing nothing if that assumption is ever violated.
+// Deps for boot reconciliation and the slash poller. This object is a
+// SINGLE shared instance reused across every entry either of them touches —
+// unlike postCollateral/confirmSettlement/slashSolver/readIntent (which all
+// take intentId as an explicit argument and are safely shared as-is),
+// runSolanaPayout's REAL implementation is a function of that entry's own
+// intentId/json/payoutDestination, which one shared closure structurally
+// cannot provide. This stub throws loudly if it's ever reached directly
+// (the slash poller never needs it; reconcileArbitrumLedger's one path that
+// does — Gate 5D-race-fix's "collateral_posted, Solana leg never started"
+// resume — is instead given a correctly-wired PER-INTENT runSolanaPayout via
+// reconcileArbitrumLedger's buildRunSolanaPayout parameter below, and never
+// falls back to this stub).
 const reconciliationDeps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, () => {
   throw new Error("runSolanaPayout must not be called from reconciliation/poller deps");
 });
@@ -640,7 +648,18 @@ async function main(): Promise<void> {
   console.log("═".repeat(64) + "\n");
 
   await reconcileSettlingLedger();
-  await reconcileArbitrumLedger(reconciliationDeps, arbClient);
+  // Gate 5D-race-fix-2: reconciliationDeps.runSolanaPayout is a throwing
+  // stub (it's one shared object across every entry this pass touches, and
+  // the real Solana payout is per-intent — see that stub's own comment
+  // above). For the one resume path that legitimately needs to run it (a
+  // collateral_posted entry whose Solana leg never started), this builds the
+  // SAME real runSolanaPayout triggerZKVerification uses, wired to that
+  // entry's own intentId/json, exactly once per entry — never touching the
+  // shared stub.
+  await reconcileArbitrumLedger(reconciliationDeps, arbClient, (intentId, json) => {
+    const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
+    return (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash);
+  });
 
   try {
     const arbBlock = await arbClient.getBlockNumber();

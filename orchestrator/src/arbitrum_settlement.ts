@@ -554,7 +554,24 @@ export async function pollAwaitingSlash(deps: ArbitrumSettlementDeps): Promise<v
 // would revert (SolverAlreadyPosted) at best or double-spend collateral at
 // worst if some future version relaxed that guard.
 
-export async function reconcileArbitrumLedger(deps: ArbitrumSettlementDeps, publicClient: PublicClient): Promise<void> {
+export async function reconcileArbitrumLedger(
+  deps: ArbitrumSettlementDeps,
+  publicClient: PublicClient,
+  /** Gate 5D-race-fix-2: `deps.runSolanaPayout` here is normally a stub that
+   *  throws (see listener.ts's `reconciliationDeps`) — a single `deps`
+   *  object is shared across every entry in this pass, but the REAL Solana
+   *  payout is a function of that entry's OWN intentId/json/payoutDestination
+   *  (decoded per-intent, exactly like triggerZKVerification does), which a
+   *  single shared closure can't provide. Only the "collateral_posted, Solana
+   *  leg never started" resume path below (added by Gate 5D-race-fix) needs a
+   *  real Solana payout during reconciliation at all — confirmSettlement /
+   *  slashSolver / postCollateral / readIntent all take intentId as an
+   *  explicit argument and are safely shared as-is. When provided, this
+   *  builds the correct per-intent runSolanaPayout for THAT resume call only;
+   *  when omitted (e.g. a caller with no live Solana leg to run, or a test),
+   *  that resume path alerts instead of ever touching deps.runSolanaPayout. */
+  buildRunSolanaPayout?: (intentId: `0x${string}`, json: ProofOutputJson) => (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult>
+): Promise<void> {
   for (const { intentId, entry } of getMidSequenceEntries()) {
     const id = (`0x${intentId}`) as `0x${string}`;
     const txHash = entry.stage === "posting_collateral" ? entry.collateralTxHash : entry.stage === "confirming" ? entry.confirmTxHash : entry.slashTxHash;
@@ -681,9 +698,18 @@ export async function reconcileArbitrumLedger(deps: ArbitrumSettlementDeps, publ
         const zkProofHash = computeZkProofHash(intentId);
         console.log(`[ARB-SETTLE] boot reconciliation: intent ${id} is collateral_posted with the Solana payout already settled — resuming confirmSettlement.`);
         await confirmSettlementWithRetry(deps, id, json, zkProofHash);
-      } else {
+      } else if (buildRunSolanaPayout) {
+        // A real, per-intent runSolanaPayout — NOT the shared deps.runSolanaPayout
+        // stub, which throws by design (see reconcileArbitrumLedger's own
+        // doc comment above): this entry's Solana leg is a function of ITS
+        // OWN intentId/json, which only the caller (listener.ts) can decode.
+        const resumeDeps: ArbitrumSettlementDeps = { ...deps, runSolanaPayout: buildRunSolanaPayout(id, json) };
         console.log(`[ARB-SETTLE] boot reconciliation: intent ${id} is collateral_posted but never got past the on-chain check — resuming from Step 2.`);
-        await resumeArbitrumSettlementFromCollateralPosted(deps, id, json);
+        await resumeArbitrumSettlementFromCollateralPosted(resumeDeps, id, json);
+      } else {
+        const reason = `collateral posted (tx ${entry.collateralTxHash}) but the Solana leg was never started, and this reconciliation pass has no way to run it (no buildRunSolanaPayout provided) — needs manual review`;
+        alert(`intent ${id}: ${reason}`);
+        recordAlertReason(id, reason);
       }
     } catch (err) {
       const reason = alreadySettled

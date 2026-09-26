@@ -716,7 +716,7 @@ async function main(): Promise<void> {
     check("the next entry's ledger reached confirmed", getArbitrumLedgerEntry(okId)?.stage === "confirmed");
   }
 
-  console.log("[gate-test] 26) reconciliation (Gate 5D-race-fix): collateral_posted + Solana leg NEVER started -> resumes from Step 2 on boot instead of sitting stuck forever");
+  console.log("[gate-test] 26) reconciliation (Gate 5D-race-fix): collateral_posted + Solana leg NEVER started -> resumes from Step 2 on boot instead of sitting stuck forever, using a real PER-INTENT runSolanaPayout from buildRunSolanaPayout, never the shared deps.runSolanaPayout stub");
   {
     const intentIdHex = "1e".repeat(32);
     const intentId = ("0x" + intentIdHex) as `0x${string}`;
@@ -734,13 +734,16 @@ async function main(): Promise<void> {
     // so a leftover entry's activity can't be mistaken for this test's.
     const expectedZkProofHash = computeZkProofHash(intentIdHex);
 
+    // Gate 5D-race-fix-2: deps.runSolanaPayout below is the SHARED stub
+    // (mirroring listener.ts's reconciliationDeps) — it must NEVER be
+    // reached by the resume path; only buildRunSolanaPayout's per-intent
+    // function may be invoked.
+    let sharedStubCalled = false;
+    let builderCalledWith: { id: string; json: ProofOutputJson } | undefined;
     let solanaPayoutCalledForThis = false;
     let confirmCallsForThis = 0;
     const deps = baseDeps({
-      runSolanaPayout: async (zkProofHash) => {
-        if (zkProofHash === expectedZkProofHash) solanaPayoutCalledForThis = true;
-        return { ok: true, sig: "solana-sig-resume" };
-      },
+      runSolanaPayout: async () => { sharedStubCalled = true; throw new Error("runSolanaPayout must not be called from reconciliation/poller deps"); },
       confirmSettlement: async (_id, _hash, onSigned) => {
         if (_id.toLowerCase() === intentId.toLowerCase()) confirmCallsForThis++;
         onSigned(("0x" + "13".repeat(32)) as `0x${string}`);
@@ -748,8 +751,16 @@ async function main(): Promise<void> {
       },
     });
     const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
-    await reconcileArbitrumLedger(deps, fakePublicClient);
-    check("the on-chain check was re-run and passed, so the Solana leg was resumed", solanaPayoutCalledForThis);
+    await reconcileArbitrumLedger(deps, fakePublicClient, (id, j) => {
+      if (id.toLowerCase() === intentId.toLowerCase()) builderCalledWith = { id, json: j };
+      return async (zkProofHash) => {
+        if (id.toLowerCase() === intentId.toLowerCase() && zkProofHash === expectedZkProofHash) solanaPayoutCalledForThis = true;
+        return { ok: true, sig: "solana-sig-resume" };
+      };
+    });
+    check("buildRunSolanaPayout was invoked with this entry's own intentId and json (not a shared static closure)", builderCalledWith?.id === intentId && builderCalledWith?.json.intent_id === json.intent_id);
+    check("the on-chain check was re-run and passed, so the per-intent Solana leg was resumed", solanaPayoutCalledForThis);
+    check("the shared deps.runSolanaPayout stub was NEVER reached", !sharedStubCalled);
     check("confirmSettlement was invoked after the Solana leg succeeded", confirmCallsForThis === 1);
     check("ledger stage advanced all the way to confirmed — no dead end", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
     check("no alert was recorded (resumed automatically instead)", !readState(intentId)?.alertReason);
@@ -764,16 +775,43 @@ async function main(): Promise<void> {
     fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
     setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "14".repeat(32), expiry: json.expiry });
 
-    let solanaPayoutCalled = false;
+    let solanaPayoutCalledForThis = false;
     const deps = baseDeps({
       readIntent: async () => mockOnChainIntent({ solver: OTHER_SOLVER }),
-      runSolanaPayout: async () => { solanaPayoutCalled = true; return { ok: true }; },
     });
     const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
-    await reconcileArbitrumLedger(deps, fakePublicClient);
-    check("solana payout never attempted", !solanaPayoutCalled);
+    await reconcileArbitrumLedger(deps, fakePublicClient, (id) => async (zkProofHash) => {
+      if (id.toLowerCase() === intentId.toLowerCase()) solanaPayoutCalledForThis = true;
+      return { ok: true, sig: "should-never-happen" };
+    });
+    check("solana payout never attempted (Step 2's own check still gates it)", !solanaPayoutCalledForThis);
     check("ledger stays at collateral_posted", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
     check("alert recorded for the genuine conflict", !!readState(intentId)?.alertReason);
+  }
+
+  console.log("[gate-test] 28) reconciliation (Gate 5D-race-fix-2): collateral_posted + Solana leg never started + NO buildRunSolanaPayout supplied -> alerts cleanly, does NOT throw / crash the reconciliation pass by falling back to the shared stub");
+  {
+    const intentIdHex = "20".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
+    setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "15".repeat(32), expiry: json.expiry });
+
+    const deps = baseDeps({
+      runSolanaPayout: async () => { throw new Error("runSolanaPayout must not be called from reconciliation/poller deps"); },
+    });
+    const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
+
+    let threw = false;
+    try {
+      await reconcileArbitrumLedger(deps, fakePublicClient); // no 3rd arg — the old call shape
+    } catch {
+      threw = true;
+    }
+    check("reconcileArbitrumLedger did not throw even with no buildRunSolanaPayout given", !threw);
+    check("ledger stays at collateral_posted (not silently advanced, not crashed)", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
+    check("alert recorded explaining reconciliation has no way to run the Solana leg", !!readState(intentId)?.alertReason?.includes("no way to run it"));
   }
 
   if (failures > 0) {
