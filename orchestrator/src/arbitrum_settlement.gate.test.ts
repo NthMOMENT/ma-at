@@ -24,12 +24,14 @@
 //   ARBITRUM_ORCHESTRATOR_PRIVATE_KEY=0x2222222222222222222222222222222222222222222222222222222222222 \
 //   SOLANA_PAYOUT_RETRY_INTERVAL_MS=1000 \
 //   CONFIRM_RETRY_BACKOFF_MS=200,200,200,200 \
+//   POST_COLLATERAL_VERIFY_DELAY_MS=50 \
 //   npx ts-node src/arbitrum_settlement.gate.test.ts
 //
-// SOLANA_PAYOUT_RETRY_INTERVAL_MS and CONFIRM_RETRY_BACKOFF_MS are optional
-// (default to the real 30s / 1-5-15-30min schedule) but strongly recommended
-// here — several tests exercise a real retry sleep, and at the real
-// defaults that's tens of minutes for one test run.
+// SOLANA_PAYOUT_RETRY_INTERVAL_MS, CONFIRM_RETRY_BACKOFF_MS, and
+// POST_COLLATERAL_VERIFY_DELAY_MS are optional (default to the real 30s /
+// 1-5-15-30min / 2s schedules) but strongly recommended here — several tests
+// exercise a real retry sleep, and at the real defaults that's tens of
+// minutes for one test run.
 import * as fs from "fs";
 import * as path from "path";
 
@@ -228,6 +230,55 @@ async function main(): Promise<void> {
       runSolanaPayout: async () => { solanaPayoutCalled = true; return { ok: true }; },
     });
     await runArbitrumSettlementSequence(deps, intentId, json);
+    check("solana payout never attempted", !solanaPayoutCalled);
+    check("ledger stays at collateral_posted (never reached confirming/confirmed)", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
+    check("state alertReason recorded", !!readState(intentId)?.alertReason);
+  }
+
+  console.log("[gate-test] 8b) sequence (Gate 5D-race-fix): on-chain read shows the pre-post default (solver=0x0, still Pending) for the first 2 reads after a receipt-confirmed postCollateral, then the real solver on the 3rd -> tolerated as a stale RPC read, NOT treated as failure");
+  {
+    const intentIdHex = "08".repeat(31) + "0b";
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    let readIntentCalls = 0;
+    const deps = baseDeps({
+      readIntent: async () => {
+        readIntentCalls++;
+        // First 2 reads: exactly the pre-post default, as if this RPC read
+        // landed on a node that hasn't caught up to postCollateral's own
+        // (already receipt-confirmed) block yet.
+        if (readIntentCalls <= 2) {
+          return mockOnChainIntent({ solver: "0x0000000000000000000000000000000000000000" as `0x${string}`, status: INTENT_STATUS_PENDING });
+        }
+        return mockOnChainIntent(); // 3rd read: the real, correct state
+      },
+    });
+    await runArbitrumSettlementSequence(deps, intentId, json);
+    // >= 3, not ===: confirmSettlementWithRetry (Step 4) also calls
+    // deps.readIntent once the sequence gets that far, on top of Step 2's 3
+    // retried reads — this assertion only cares that Step 2 itself retried.
+    check("readIntent was retried (called more than once)", readIntentCalls >= 3);
+    check("no alert recorded — the stale reads were tolerated, not treated as a conflict", !readState(intentId)?.alertReason);
+    check("sequence proceeded all the way to confirmed", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
+  }
+
+  console.log("[gate-test] 8c) sequence (Gate 5D-race-fix): on-chain read shows a DIFFERENT real solver address immediately -> fails on the FIRST read, no retry masks a genuine conflict");
+  {
+    const intentIdHex = "08".repeat(31) + "0c";
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    let readIntentCalls = 0;
+    let solanaPayoutCalled = false;
+    const deps = baseDeps({
+      readIntent: async () => {
+        readIntentCalls++;
+        return mockOnChainIntent({ solver: OTHER_SOLVER }); // a genuine conflict, not staleness
+      },
+      runSolanaPayout: async () => { solanaPayoutCalled = true; return { ok: true }; },
+    });
+    await runArbitrumSettlementSequence(deps, intentId, json);
+    check("readIntent was called exactly once — no retry attempted", readIntentCalls === 1);
     check("solana payout never attempted", !solanaPayoutCalled);
     check("ledger stays at collateral_posted (never reached confirming/confirmed)", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
     check("state alertReason recorded", !!readState(intentId)?.alertReason);
@@ -663,6 +714,66 @@ async function main(): Promise<void> {
     check("the throwing entry's ledger stage stays collateral_posted (not silently advanced)", getArbitrumLedgerEntry(throwingId)?.stage === "collateral_posted");
     check("the NEXT entry was still processed (confirmSettlement invoked despite the first entry's throw)", confirmCalls === 1);
     check("the next entry's ledger reached confirmed", getArbitrumLedgerEntry(okId)?.stage === "confirmed");
+  }
+
+  console.log("[gate-test] 26) reconciliation (Gate 5D-race-fix): collateral_posted + Solana leg NEVER started -> resumes from Step 2 on boot instead of sitting stuck forever");
+  {
+    const intentIdHex = "1e".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
+    // Reproduces the live incident exactly: collateral posted, Step 2's
+    // on-chain check failed (or the process crashed before Step 3 ever ran),
+    // so the Solana leg never started — isAlreadySettled is false here.
+    setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "12".repeat(32), expiry: json.expiry });
+    // The ledger file/state persist across this whole test run, so earlier
+    // blocks' still-"collateral_posted" entries (e.g. test 8's genuine
+    // solver-mismatch leftover) get swept by THIS SAME reconcileArbitrumLedger
+    // call too — filter every callback by THIS test's own zkProofHash/intentId
+    // so a leftover entry's activity can't be mistaken for this test's.
+    const expectedZkProofHash = computeZkProofHash(intentIdHex);
+
+    let solanaPayoutCalledForThis = false;
+    let confirmCallsForThis = 0;
+    const deps = baseDeps({
+      runSolanaPayout: async (zkProofHash) => {
+        if (zkProofHash === expectedZkProofHash) solanaPayoutCalledForThis = true;
+        return { ok: true, sig: "solana-sig-resume" };
+      },
+      confirmSettlement: async (_id, _hash, onSigned) => {
+        if (_id.toLowerCase() === intentId.toLowerCase()) confirmCallsForThis++;
+        onSigned(("0x" + "13".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "13".repeat(32)) as `0x${string}` };
+      },
+    });
+    const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
+    await reconcileArbitrumLedger(deps, fakePublicClient);
+    check("the on-chain check was re-run and passed, so the Solana leg was resumed", solanaPayoutCalledForThis);
+    check("confirmSettlement was invoked after the Solana leg succeeded", confirmCallsForThis === 1);
+    check("ledger stage advanced all the way to confirmed — no dead end", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
+    check("no alert was recorded (resumed automatically instead)", !readState(intentId)?.alertReason);
+  }
+
+  console.log("[gate-test] 27) reconciliation (Gate 5D-race-fix): collateral_posted + Solana leg never started + on-chain check finds a GENUINE conflict -> alerts, does not blindly pay Solana");
+  {
+    const intentIdHex = "1f".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
+    setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "14".repeat(32), expiry: json.expiry });
+
+    let solanaPayoutCalled = false;
+    const deps = baseDeps({
+      readIntent: async () => mockOnChainIntent({ solver: OTHER_SOLVER }),
+      runSolanaPayout: async () => { solanaPayoutCalled = true; return { ok: true }; },
+    });
+    const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
+    await reconcileArbitrumLedger(deps, fakePublicClient);
+    check("solana payout never attempted", !solanaPayoutCalled);
+    check("ledger stays at collateral_posted", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
+    check("alert recorded for the genuine conflict", !!readState(intentId)?.alertReason);
   }
 
   if (failures > 0) {
