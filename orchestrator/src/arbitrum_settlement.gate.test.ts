@@ -69,7 +69,7 @@ import {
 } from "./arbitrum_settlement";
 import { getArbitrumLedgerEntry, setArbitrumStage } from "./arbitrum_ledger";
 import { readState } from "./intent_state";
-import { markSettled, type ProofOutputJson } from "./prover_pipeline";
+import { markSettled, markSettling, getLedgerEntry, type ProofOutputJson } from "./prover_pipeline";
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -135,6 +135,9 @@ function baseDeps(overrides: Partial<ArbitrumSettlementDeps> = {}): ArbitrumSett
     },
     async runSolanaPayout() {
       return { ok: true, sig: "solana-sig-1" };
+    },
+    async checkSolanaSignatureLanded() {
+      return false; // preserves pre-Gate-5D-slash-fix behavior by default: nothing to find, so slash proceeds
     },
     nowSec: () => Math.floor(Date.now() / 1000),
     ...overrides,
@@ -546,6 +549,141 @@ async function main(): Promise<void> {
     const entry = getArbitrumLedgerEntry(intentId);
     check("ledger stage stays slashing", entry?.stage === "slashing");
     check("slash txHash recorded despite the revert", entry?.slashTxHash === "0x" + "33".repeat(32));
+  }
+
+  // ══════════════════ pollAwaitingSlash (Gate 5D-slash-fix) ══════════════════
+  // Reproduces the reported incident exactly: an intent's Solana payout
+  // actually landed (a real, confirmed signature), but the local ledger
+  // never learned that (still "settling") — pollAwaitingSlash must re-check
+  // the signature FRESH, right now, and must NOT slash a solver who
+  // delivered.
+
+  console.log("[gate-test] 17b) pollAwaitingSlash (Gate 5D-slash-fix): recorded Solana signature IS confirmed right now -> slashSolver NEVER called, confirmSettlement resumed instead");
+  {
+    const intentIdHex = "21".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
+
+    // Exactly the incident: the local ledger only ever recorded "settling"
+    // (the payout was signed, but this process never confirmed it landed) —
+    // never "settled" — yet the signature is, in fact, confirmed on Solana
+    // right now.
+    markSettling(intentId, "incident-sig-landed");
+    const fakeNow = Math.floor(Date.now() / 1000);
+    setArbitrumStage(intentId, "awaiting_expiry_slash", { expiry: fakeNow - 10 });
+
+    let slashCalled = false;
+    let confirmCalls = 0;
+    let checkedSig: string | undefined;
+    const deps = baseDeps({
+      slashSolver: async (_id, onSigned) => {
+        slashCalled = true;
+        onSigned(("0x" + "aa".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "aa".repeat(32)) as `0x${string}` };
+      },
+      confirmSettlement: async (_id, _hash, onSigned) => {
+        confirmCalls++;
+        onSigned(("0x" + "bb".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "bb".repeat(32)) as `0x${string}` };
+      },
+      checkSolanaSignatureLanded: async (sig) => {
+        checkedSig = sig;
+        return sig === "incident-sig-landed"; // fresh check: confirmed, right now
+      },
+      nowSec: () => fakeNow,
+    });
+    await pollAwaitingSlash(deps);
+
+    check("the signature was checked FRESH (not from a cached flag)", checkedSig === "incident-sig-landed");
+    check("slashSolver was NEVER called — the solver who delivered is not punished", !slashCalled);
+    check("confirmSettlement was resumed instead", confirmCalls === 1);
+    check("ledger stage is confirmed, not slashed", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
+    check("local Solana ledger corrected from settling to settled", getLedgerEntry(intentId)?.status === "settled");
+  }
+
+  console.log("[gate-test] 17c) pollAwaitingSlash (Gate 5D-slash-fix): recorded Solana signature genuinely did NOT land -> slashSolver IS called (a real non-delivery must still be punishable)");
+  {
+    const intentIdHex = "22".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    markSettling(intentId, "incident-sig-never-landed");
+    const fakeNow = Math.floor(Date.now() / 1000);
+    setArbitrumStage(intentId, "awaiting_expiry_slash", { expiry: fakeNow - 10 });
+
+    let slashCalled = false;
+    let checkedSig: string | undefined;
+    const deps = baseDeps({
+      slashSolver: async (_id, onSigned) => {
+        slashCalled = true;
+        onSigned(("0x" + "cc".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "cc".repeat(32)) as `0x${string}` };
+      },
+      checkSolanaSignatureLanded: async (sig) => {
+        checkedSig = sig;
+        return false; // fresh check: genuinely never landed
+      },
+      nowSec: () => fakeNow,
+    });
+    await pollAwaitingSlash(deps);
+
+    check("the signature was checked FRESH", checkedSig === "incident-sig-never-landed");
+    check("slashSolver WAS called — a genuinely non-delivering solver is still slashable", slashCalled);
+    check("ledger stage is slashed", getArbitrumLedgerEntry(intentId)?.stage === "slashed");
+    check("local Solana ledger stays settling (never falsely marked settled)", getLedgerEntry(intentId)?.status === "settling");
+  }
+
+  console.log("[gate-test] 17d) pollAwaitingSlash (Gate 5D-slash-fix): no Solana signature was ever recorded (Solana leg never started) -> slashSolver IS called, no signature check even attempted");
+  {
+    const intentIdHex = "23".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const fakeNow = Math.floor(Date.now() / 1000);
+    setArbitrumStage(intentId, "awaiting_expiry_slash", { expiry: fakeNow - 10 });
+
+    let slashCalled = false;
+    let checkCalled = false;
+    const deps = baseDeps({
+      slashSolver: async (_id, onSigned) => {
+        slashCalled = true;
+        onSigned(("0x" + "dd".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "dd".repeat(32)) as `0x${string}` };
+      },
+      checkSolanaSignatureLanded: async () => {
+        checkCalled = true;
+        return true;
+      },
+      nowSec: () => fakeNow,
+    });
+    await pollAwaitingSlash(deps);
+
+    check("no signature check attempted — there was never one recorded", !checkCalled);
+    check("slashSolver WAS called", slashCalled);
+    check("ledger stage is slashed", getArbitrumLedgerEntry(intentId)?.stage === "slashed");
+  }
+
+  console.log("[gate-test] 17e) pollAwaitingSlash (Gate 5D-slash-fix): signature confirmed, but proof_<id>.json is missing -> still refuses to slash, alerts for manual review instead of guessing");
+  {
+    const intentIdHex = "24".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    markSettling(intentId, "incident-sig-landed-no-json");
+    const fakeNow = Math.floor(Date.now() / 1000);
+    setArbitrumStage(intentId, "awaiting_expiry_slash", { expiry: fakeNow - 10 }); // no proof_<id>.json/.bin ever written for this id
+
+    let slashCalled = false;
+    const deps = baseDeps({
+      slashSolver: async (_id, onSigned) => {
+        slashCalled = true;
+        onSigned(("0x" + "ee".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "ee".repeat(32)) as `0x${string}` };
+      },
+      checkSolanaSignatureLanded: async () => true,
+      nowSec: () => fakeNow,
+    });
+    await pollAwaitingSlash(deps);
+
+    check("slashSolver was NEVER called despite the missing proof JSON", !slashCalled);
+    check("ledger did not advance to slashed", getArbitrumLedgerEntry(intentId)?.stage !== "slashed");
+    check("alert recorded explaining it needs manual review", !!readState(intentId)?.alertReason?.includes("needs manual review"));
   }
 
   // ══════════════════ reconcileArbitrumLedger (boot reconciliation) ══════════════════

@@ -4,15 +4,30 @@
 // in this package yet, so this is a plain assertion script pending a real
 // one being approved; run with:
 //
-//   SETTLED_LEDGER_PATH=/tmp/gate-test-ledger.json npx ts-node src/prover_pipeline.gate.test.ts
+//   SETTLED_LEDGER_PATH=/tmp/gate-test-ledger.json \
+//   MAAT_STATE_DIR=/tmp/gate-test-state \
+//   ALERT_LOG_PATH=/tmp/gate-test-alerts.log \
+//   npx ts-node src/prover_pipeline.gate.test.ts
 //
-// The SETTLED_LEDGER_PATH override is required — without it this would read
-// and write the real settled_intents.json ledger.
-import { evaluateSettleGate, markSettled, EXPECTED_VKEY, type ProofOutputJson } from "./prover_pipeline";
+// All three overrides are required — without them this would read/write the
+// real settled_intents.json ledger, per-intent state files, and alerts.log
+// (reconcileSettlingLedger's tests below touch all three).
+import {
+  evaluateSettleGate,
+  markSettled,
+  markSettling,
+  getLedgerEntry,
+  reconcileSettlingLedger,
+  _resetSettlingAlertDedupeForTests,
+  EXPECTED_VKEY,
+  type ProofOutputJson,
+} from "./prover_pipeline";
 
-if (!process.env.SETTLED_LEDGER_PATH) {
-  console.error("[gate-test] refusing to run without SETTLED_LEDGER_PATH set (would touch the real ledger)");
-  process.exit(1);
+for (const v of ["SETTLED_LEDGER_PATH", "MAAT_STATE_DIR", "ALERT_LOG_PATH"]) {
+  if (!process.env[v]) {
+    console.error(`[gate-test] refusing to run without ${v} set (would touch real state)`);
+    process.exit(1);
+  }
 }
 
 const EXPECTED_CONTRACT = "0x9D1bd7119E9FefF6Baa3968272811323B354B16f";
@@ -104,9 +119,100 @@ console.log("[gate-test] 7) expired intent");
   check("failed on expiry", gate.failedChecks.includes("expiry"));
 }
 
+// ══════════════════ reconcileSettlingLedger (Gate 5D-slash-fix) ══════════════════
+// Fresh Solana-signature check every call, dedupes its own repeat alerts,
+// and — the actual gate — an entry that was "needs manual review" at one
+// call because it hadn't landed YET gets picked up automatically the moment
+// a later call finds it landed, instead of staying stuck forever.
+//
+// Wrapped in an async IIFE: everything above this point is synchronous
+// (evaluateSettleGate is pure), but reconcileSettlingLedger is async, and
+// this file (a plain script, no test runner) has no top-level await.
+(async () => {
+
+console.log("[gate-test] 8) reconcileSettlingLedger: signature confirmed -> marked settled, not left in settling");
+{
+  const intentId = "0x" + "aa".repeat(32);
+  markSettling(intentId, "sig-confirmed-now");
+  let checkCalls = 0;
+  await reconcileSettlingLedger({
+    checkSolanaSignatureLanded: async (sig) => {
+      checkCalls++;
+      return sig === "sig-confirmed-now";
+    },
+  });
+  check("signature was checked", checkCalls === 1);
+  check("ledger entry marked settled", getLedgerEntry(intentId)?.status === "settled");
+}
+
+console.log("[gate-test] 9) reconcileSettlingLedger: not yet landed -> stays settling, alerted");
+{
+  const intentId = "0x" + "bb".repeat(32);
+  markSettling(intentId, "sig-not-yet-landed");
+  await reconcileSettlingLedger({ checkSolanaSignatureLanded: async (sig) => sig === "sig-not-yet-landed" ? false : false });
+  check("ledger entry stays settling", getLedgerEntry(intentId)?.status === "settling");
+}
+
+console.log("[gate-test] 10) reconcileSettlingLedger: called again later, now landed -> automatically picked up and marked settled (the actual gate: not stuck forever just because an earlier call said 'needs manual review')");
+{
+  const intentId = "0x" + "cc".repeat(32);
+  markSettling(intentId, "sig-lands-eventually");
+  await reconcileSettlingLedger({ checkSolanaSignatureLanded: async (sig) => (sig === "sig-lands-eventually" ? false : false) });
+  check("first call: still settling", getLedgerEntry(intentId)?.status === "settling");
+
+  // Simulates a later periodic call (Gate 5D-slash-fix's setInterval in
+  // listener.ts) — same signature, now confirmed on Solana. Scoped by sig so
+  // it only resolves THIS entry, not any other still-pending leftover one.
+  await reconcileSettlingLedger({ checkSolanaSignatureLanded: async (sig) => sig === "sig-lands-eventually" });
+  check("later call: automatically marked settled, no manual intervention needed", getLedgerEntry(intentId)?.status === "settled");
+}
+
+console.log("[gate-test] 11) reconcileSettlingLedger: repeat calls on a still-unresolved entry alert only ONCE (dedupe), not on every periodic tick");
+{
+  _resetSettlingAlertDedupeForTests();
+  const intentId = "0x" + "dd".repeat(32);
+  markSettling(intentId, "sig-stuck");
+  let stuckCheckCalls = 0;
+  const deps = {
+    checkSolanaSignatureLanded: async (sig: string) => {
+      if (sig === "sig-stuck") stuckCheckCalls++;
+      return false;
+    },
+  };
+  await reconcileSettlingLedger(deps);
+  await reconcileSettlingLedger(deps);
+  await reconcileSettlingLedger(deps);
+  check("the signature was re-checked fresh on every call (never cached)", stuckCheckCalls === 3);
+  check("still settling after 3 unresolved checks", getLedgerEntry(intentId)?.status === "settling");
+}
+
+console.log("[gate-test] 12) reconcileSettlingLedger: a fresh signature-check failure (thrown, not just false) for one entry alerts for THAT entry but doesn't stop the pass");
+{
+  const okId = "0x" + "ee".repeat(32);
+  const brokenId = "0x" + "ff".repeat(32);
+  markSettling(okId, "sig-ok");
+  markSettling(brokenId, "sig-rpc-throws");
+  let threw = false;
+  try {
+    await reconcileSettlingLedger({
+      checkSolanaSignatureLanded: async (sig) => {
+        if (sig === "sig-rpc-throws") throw new Error("simulated RPC failure");
+        return sig === "sig-ok";
+      },
+    });
+  } catch {
+    threw = true;
+  }
+  check("reconcileSettlingLedger itself did not throw", !threw);
+  check("the unaffected entry still resolved to settled", getLedgerEntry(okId)?.status === "settled");
+  check("the entry whose check threw stays settling (not silently marked either way)", getLedgerEntry(brokenId)?.status === "settling");
+}
+
 if (failures > 0) {
   console.error(`\n[gate-test] ${failures} check(s) FAILED`);
   process.exit(1);
 } else {
   console.log(`\n[gate-test] all checks passed`);
 }
+
+})();

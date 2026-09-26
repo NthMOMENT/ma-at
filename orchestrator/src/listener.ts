@@ -25,10 +25,10 @@ import {
   evaluateSettleGate,
   isAlreadySettled,
   getLedgerEntry,
-  getSettlingEntries,
   markSettling,
   markSettled,
   alert,
+  reconcileSettlingLedger,
   type ProofOutputJson,
 } from "./prover_pipeline";
 import {
@@ -101,6 +101,15 @@ const FINALITY_POLL_INTERVAL_MS = Number(process.env.FINALITY_POLL_INTERVAL_MS ?
 // against the wall clock — see pollAwaitingSlash (arbitrum_settlement.ts).
 const SLASH_POLL_INTERVAL_MS = Number(process.env.SLASH_POLL_INTERVAL_MS ?? 60000);
 
+// Gate 5D-slash-fix: how often to re-check any locally "settling" (signed
+// but unconfirmed) Solana payout against its real on-chain signature status
+// — see reconcileSettlingLedger (prover_pipeline.ts). Previously this only
+// ran once, at boot; an entry that hadn't landed yet at that exact moment
+// was stuck on "needs manual review" forever, with no automatic way to
+// notice it landing later, right up until pollAwaitingSlash's own fresh
+// check (also part of this gate) would otherwise slash it.
+const SETTLING_RECONCILE_INTERVAL_MS = Number(process.env.SETTLING_RECONCILE_INTERVAL_MS ?? 60000);
+
 // PROVER_BINARY is imported from ./prover_pipeline (single source of truth
 // for the spawn path, since that's what actually invokes it).
 const SETTLE_SCRIPT = process.env.SETTLE_SCRIPT_PATH ?? path.resolve(__dirname, "../settle_intent.js");
@@ -109,6 +118,16 @@ const SETTLE_SCRIPT = process.env.SETTLE_SCRIPT_PATH ?? path.resolve(__dirname, 
 // settled-ledger's "settling" entries against Solana on boot (Gate 5B-fix).
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com";
 const solanaConnection = new Connection(SOLANA_RPC_URL, "confirmed");
+
+// Gate 5D-slash-fix: the ONE fresh Solana-signature check, shared by
+// reconcileSettlingLedger (prover_pipeline.ts, via the reconcileDeps below)
+// and pollAwaitingSlash (arbitrum_settlement.ts, via buildRealDeps) — both
+// must use the identical real check, never two independently-written copies
+// of the same "is this signature actually confirmed" logic.
+async function checkSolanaSignatureLanded(sig: string): Promise<boolean> {
+  const status = await solanaConnection.getSignatureStatus(sig, { searchTransactionHistory: true });
+  return !!status.value && !status.value.err && (status.value.confirmationStatus === "confirmed" || status.value.confirmationStatus === "finalized");
+}
 
 if (ALCHEMY_RPC_URLS.length === 0) {
   console.error("[FATAL] at least one of ALCHEMY_RPC_URL_1/2/3 must be set in .env");
@@ -224,9 +243,14 @@ const rhClient = createPublicClient({
 // resume — is instead given a correctly-wired PER-INTENT runSolanaPayout via
 // reconcileArbitrumLedger's buildRunSolanaPayout parameter below, and never
 // falls back to this stub).
-const reconciliationDeps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, () => {
-  throw new Error("runSolanaPayout must not be called from reconciliation/poller deps");
-});
+const reconciliationDeps = buildRealDeps(
+  arbClient,
+  ARBITRUM_INTENT_MANAGER_ADDRESS,
+  () => {
+    throw new Error("runSolanaPayout must not be called from reconciliation/poller deps");
+  },
+  checkSolanaSignatureLanded
+);
 
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 
@@ -317,7 +341,12 @@ function triggerZKVerification(
     const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
 
     console.log(`[SETTLE] all gate checks passed — running Arbitrum settlement sequence (postCollateral -> Solana payout -> confirmSettlement/slashSolver)...`);
-    const deps = buildRealDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash));
+    const deps = buildRealDeps(
+      arbClient,
+      ARBITRUM_INTENT_MANAGER_ADDRESS,
+      (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash),
+      checkSolanaSignatureLanded
+    );
     await runArbitrumSettlementSequence(deps, json.intent_id as `0x${string}`, json);
   });
 }
@@ -573,42 +602,16 @@ function watchChain(
 }
 
 // ─── Ledger reconciliation ────────────────────────────────────────────────────
-// Fix 6 (Gate 5B-fix): on every boot, before touching any watcher, resolve
-// every intent this process (or a prior crashed instance of it) left in
-// "settling" — a payout that was signed and whose signature we recorded,
-// but never confirmed as sent. We check the signature on Solana directly;
-// we never re-invoke settle_intent.js for one of these, since the original
-// signed tx may already have landed.
-
-async function reconcileSettlingLedger(): Promise<void> {
-  const pending = getSettlingEntries();
-  if (pending.length === 0) return;
-
-  console.log(`[LEDGER] ${pending.length} intent(s) left in "settling" from a previous run — checking their signatures on Solana first...`);
-  for (const { intentId, solanaSig } of pending) {
-    try {
-      const status = await solanaConnection.getSignatureStatus(solanaSig, { searchTransactionHistory: true });
-      const landed =
-        !!status.value &&
-        !status.value.err &&
-        (status.value.confirmationStatus === "confirmed" || status.value.confirmationStatus === "finalized");
-      if (landed) {
-        markSettled(intentId);
-        setSettled(intentId, solanaSig);
-        console.log(`[LEDGER] intent 0x${intentId}: sig ${solanaSig} landed on-chain — marked settled.`);
-      } else {
-        const reason = `still "settling" (sig ${solanaSig}) with no confirmed landing on Solana — NOT auto-resettling. Needs manual review before any retry.`;
-        alert(`intent 0x${intentId}: ${reason}`);
-        setUnconfirmedNeedsReview(intentId, solanaSig);
-        recordAlertReason(intentId, reason);
-      }
-    } catch (err) {
-      const reason = `failed to check signature ${solanaSig} on Solana during boot reconciliation: ${(err as Error).message} — NOT auto-resettling.`;
-      alert(`intent 0x${intentId}: ${reason}`);
-      recordAlertReason(intentId, reason);
-    }
-  }
-}
+// Fix 6 (Gate 5B-fix): resolve every intent this process (or a prior crashed
+// instance of it) left in "settling" — a payout that was signed and whose
+// signature we recorded, but never confirmed as sent. We check the
+// signature on Solana directly; we never re-invoke settle_intent.js for one
+// of these, since the original signed tx may already have landed.
+//
+// Gate 5D-slash-fix: the actual reconciliation logic now lives in
+// prover_pipeline.ts's reconcileSettlingLedger (dedupes its own repeat
+// alerts and is safe to call on every boot AND periodically — see main()'s
+// setInterval below) — this file only wires it to the real Solana check.
 
 // ─── Finality poller ───────────────────────────────────────────────────────
 // Gate 5C: every FINALITY_POLL_INTERVAL_MS, re-fetch Arbitrum Sepolia's
@@ -647,7 +650,7 @@ async function main(): Promise<void> {
   console.log(`  Prover:  ${PROVER_BINARY}`);
   console.log("═".repeat(64) + "\n");
 
-  await reconcileSettlingLedger();
+  await reconcileSettlingLedger({ checkSolanaSignatureLanded });
   // Gate 5D-race-fix-2: reconciliationDeps.runSolanaPayout is a throwing
   // stub (it's one shared object across every entry this pass touches, and
   // the real Solana payout is per-intent — see that stub's own comment
@@ -703,6 +706,12 @@ async function main(): Promise<void> {
   setInterval(() => {
     pollAwaitingSlash(reconciliationDeps).catch((err) => logError("[SLASH] poll failed:", err));
   }, SLASH_POLL_INTERVAL_MS);
+
+  // Gate 5D-slash-fix: periodic, not just boot-once — see
+  // SETTLING_RECONCILE_INTERVAL_MS's doc comment above.
+  setInterval(() => {
+    reconcileSettlingLedger({ checkSolanaSignatureLanded }).catch((err) => logError("[LEDGER] periodic reconciliation failed:", err));
+  }, SETTLING_RECONCILE_INTERVAL_MS);
 
   console.log("\n[Orchestrator] Listening. Waiting for intents...\n");
 }

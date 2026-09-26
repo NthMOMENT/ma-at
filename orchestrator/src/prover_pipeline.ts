@@ -7,7 +7,7 @@
 import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { setProving, setRetrying, setVerified, setRejected, setAlert } from "./intent_state";
+import { setProving, setRetrying, setVerified, setRejected, setAlert, setSettled, setUnconfirmedNeedsReview, recordAlertReason } from "./intent_state";
 import { redact } from "./redact";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -173,6 +173,66 @@ export function getSettlingEntries(): Array<{ intentId: string; solanaSig: strin
     if (entry.status === "settling" && entry.solanaSig) out.push({ intentId, solanaSig: entry.solanaSig });
   }
   return out;
+}
+
+// Gate 5D-slash-fix: dedupes the "needs manual review" alert per signature,
+// keyed in-memory — this now runs periodically (see listener.ts), not just
+// once at boot, so the same still-unresolved signature would otherwise
+// re-alert on every interval forever. Cleared the moment a signature
+// resolves, so a genuinely new stall on the SAME signature (impossible in
+// practice — a signature doesn't un-resolve) would still be re-reported.
+const alreadyAlertedSettlingSigs = new Set<string>();
+
+/// Test-only reset — nothing in production code needs to clear this.
+export function _resetSettlingAlertDedupeForTests(): void {
+  alreadyAlertedSettlingSigs.clear();
+}
+
+export interface SettlingReconcileDeps {
+  /** Fresh, right now — never a cached flag. See listener.ts's real
+   *  implementation (solanaConnection.getSignatureStatus) and this
+   *  function's own doc comment below. */
+  checkSolanaSignatureLanded(sig: string): Promise<boolean>;
+}
+
+/// Re-verifies every locally "settling" (signed-but-unconfirmed) entry
+/// against Solana's REAL signature status, fresh, every single time this is
+/// called — never assumes a previous call's outcome still holds. Gate
+/// 5D-slash-fix: this used to run once, at process boot, and permanently
+/// gave up to "needs manual review" on anything not yet landed at that exact
+/// moment — a signature merely slow to confirm at boot-check time then had
+/// no way to ever resolve automatically, silently drifting toward
+/// arbitrum_settlement.ts's slash path with no further checks. Callable
+/// repeatedly/periodically instead: an entry that resolves to "settled"
+/// leaves getSettlingEntries()'s result set for good and is never touched
+/// again; one that's still ambiguous is simply re-checked next time.
+export async function reconcileSettlingLedger(deps: SettlingReconcileDeps): Promise<void> {
+  const pending = getSettlingEntries();
+  if (pending.length === 0) return;
+
+  for (const { intentId, solanaSig } of pending) {
+    try {
+      const landed = await deps.checkSolanaSignatureLanded(solanaSig);
+      if (landed) {
+        markSettled(intentId);
+        setSettled(intentId, solanaSig);
+        alreadyAlertedSettlingSigs.delete(solanaSig);
+        console.log(`[LEDGER] intent 0x${intentId}: sig ${solanaSig} landed on-chain — marked settled.`);
+      } else if (!alreadyAlertedSettlingSigs.has(solanaSig)) {
+        alreadyAlertedSettlingSigs.add(solanaSig);
+        const reason =
+          `still "settling" (sig ${solanaSig}) with no confirmed landing on Solana — NOT auto-resettling. Needs manual review; ` +
+          `will keep re-checking automatically until it lands or the intent is otherwise resolved.`;
+        alert(`intent 0x${intentId}: ${reason}`);
+        setUnconfirmedNeedsReview(intentId, solanaSig);
+        recordAlertReason(intentId, reason);
+      }
+    } catch (err) {
+      const reason = `failed to check signature ${solanaSig} on Solana during reconciliation: ${(err as Error).message} — NOT auto-resettling.`;
+      alert(`intent 0x${intentId}: ${reason}`);
+      recordAlertReason(intentId, reason);
+    }
+  }
 }
 
 // ─── Prover invocation ────────────────────────────────────────────────────────

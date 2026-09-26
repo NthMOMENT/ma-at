@@ -16,9 +16,9 @@ import { createHash } from "crypto";
 import type { PublicClient } from "viem";
 import type { ProofOutputJson } from "./prover_pipeline";
 import { ZK_DIR, alert } from "./prover_pipeline";
-import { recordAlertReason, setArbitrumSettlement, type ArbitrumSettlementStage } from "./intent_state";
+import { recordAlertReason, setArbitrumSettlement, setSettled, type ArbitrumSettlementStage } from "./intent_state";
 import { setArbitrumStage, getArbitrumLedgerEntry, getMidSequenceEntries, getAwaitingExpirySlashEntries, getCollateralPostedEntries } from "./arbitrum_ledger";
-import { isAlreadySettled, readProofJson } from "./prover_pipeline";
+import { isAlreadySettled, readProofJson, getLedgerEntry, markSettled } from "./prover_pipeline";
 import { redact } from "./redact";
 import { createRotatingHttpTransport } from "./rpc_rotation";
 
@@ -239,6 +239,13 @@ export interface ArbitrumSettlementDeps {
    *  sends to Arbitrum — one source of truth for both legs, never
    *  recomputed independently on the Solana side. */
   runSolanaPayout(zkProofHash: `0x${string}`): Promise<SolanaPayoutResult>;
+  /** Gate 5D-slash-fix: checks a Solana signature's status FRESH, right now
+   *  — never a cached/local flag. Used by pollAwaitingSlash immediately
+   *  before it would otherwise slash, so a payout that actually landed (but
+   *  whose local "settling" record was never resolved to "settled") is
+   *  never punished. Same underlying check as prover_pipeline.ts's
+   *  reconcileSettlingLedger — see listener.ts's real implementation. */
+  checkSolanaSignatureLanded(sig: string): Promise<boolean>;
   nowSec(): number;
 }
 
@@ -302,7 +309,8 @@ export async function readIntentAfterPostCollateral(
 export function buildRealDeps(
   publicClient: PublicClient,
   intentManagerAddress: `0x${string}`,
-  runSolanaPayout: (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult>
+  runSolanaPayout: (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult>,
+  checkSolanaSignatureLanded: (sig: string) => Promise<boolean>
 ): ArbitrumSettlementDeps {
   return {
     solverAddress: solverAccount.address,
@@ -343,6 +351,7 @@ export function buildRealDeps(
       return signAndSend(orchestratorWalletClient, publicClient, orchestratorAccount, { functionName: "slashSolver", args: [intentId], address: intentManagerAddress }, onSigned);
     },
     runSolanaPayout,
+    checkSolanaSignatureLanded,
     nowSec: () => Math.floor(Date.now() / 1000),
   };
 }
@@ -525,10 +534,69 @@ export async function confirmSettlementWithRetry(
 
 // ─── Slash poller (listener.ts calls this on an interval, like pollFinality) ──
 
+/// Gate 5D-slash-fix: the incident this closes — slashSolver fired for an
+/// intent whose Solana payout had ACTUALLY succeeded, because nothing
+/// re-checked the recorded Solana signature fresh before slashing. The
+/// local settled-intent ledger's "settled" status is definitive once set;
+/// its "settling" status is the ambiguous case (a payout that may have
+/// landed despite this process never confirming it — see
+/// prover_pipeline.ts's reconcileSettlingLedger) — and that ambiguous case
+/// is exactly what must never be resolved by assumption immediately before
+/// an irreversible slash. Mirrors the SAME discipline already used by
+/// confirmSettlementWithRetry (fresh readIntent before every attempt) and
+/// reconcileSettlingLedger (fresh getSignatureStatus) — re-check ground
+/// truth at the moment of the decision, not from any snapshot taken
+/// earlier. Returns true if slashing was averted (and confirmSettlement was
+/// resumed, or an alert was recorded because it couldn't be) — the caller
+/// must not slash in that case. Returns false only when there is nothing to
+/// re-check (no Solana leg was ever recorded) or the fresh check confirms it
+/// genuinely never landed — a genuinely non-delivering solver must still be
+/// slashable.
+async function resumeConfirmIfSolanaLanded(deps: ArbitrumSettlementDeps, id: `0x${string}`, intentIdHex: string): Promise<boolean> {
+  const ledgerEntry = getLedgerEntry(id);
+  if (!ledgerEntry) return false; // Solana leg never even started — nothing to re-check.
+
+  let landed = ledgerEntry.status === "settled";
+  if (!landed && ledgerEntry.solanaSig) {
+    landed = await deps.checkSolanaSignatureLanded(ledgerEntry.solanaSig);
+  }
+  if (!landed) return false; // genuinely never delivered (or no signature to check) — slash as before.
+
+  if (ledgerEntry.status !== "settled" && ledgerEntry.solanaSig) {
+    // The fresh check just proved what reconcileSettlingLedger's own boot/
+    // periodic check hadn't yet — bring the local ledger in line so nothing
+    // downstream re-derives this from scratch.
+    markSettled(id);
+    setSettled(id, ledgerEntry.solanaSig);
+  }
+
+  const json = readProofJson(intentIdHex);
+  if (!json) {
+    const reason =
+      `awaiting_expiry_slash, but the Solana payout (sig ${ledgerEntry.solanaSig ?? "unknown"}) is confirmed on Solana right now — refusing to ` +
+      `slash a solver who delivered — but proof_${intentIdHex}.json is missing/invalid, so confirmSettlement cannot be resumed automatically ` +
+      `either — needs manual review.`;
+    alert(`intent ${id}: ${reason}`);
+    recordAlertReason(id, reason);
+    return true; // NOT slashed — that's the point — even though it can't fully resume either.
+  }
+
+  console.log(
+    `[ARB-SETTLE] intent ${id}: awaiting_expiry_slash, but the Solana payout (sig ${ledgerEntry.solanaSig ?? "unknown"}) is confirmed on Solana ` +
+      `right now — NOT slashing; resuming confirmSettlement instead.`
+  );
+  const zkProofHash = computeZkProofHash(intentIdHex);
+  await confirmSettlementWithRetry(deps, id, json, zkProofHash);
+  return true;
+}
+
 export async function pollAwaitingSlash(deps: ArbitrumSettlementDeps): Promise<void> {
   for (const { intentId, entry } of getAwaitingExpirySlashEntries()) {
     if (entry.expiry == null || deps.nowSec() < entry.expiry) continue;
     const id = (`0x${intentId}`) as `0x${string}`;
+
+    if (await resumeConfirmIfSolanaLanded(deps, id, intentId)) continue;
+
     const outcome = await deps.slashSolver(id, (hash) => {
       setArbitrumStage(id, "slashing", { slashTxHash: hash });
       mirrorDisplay(id, { stage: "slashing", slashTxHash: hash });
