@@ -67,7 +67,7 @@ import {
 } from "./arbitrum_settlement";
 import { getArbitrumLedgerEntry, setArbitrumStage } from "./arbitrum_ledger";
 import { readState } from "./intent_state";
-import type { ProofOutputJson } from "./prover_pipeline";
+import { markSettled, type ProofOutputJson } from "./prover_pipeline";
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -568,6 +568,101 @@ async function main(): Promise<void> {
     check("Solana leg received computeZkProofHash's real output", solanaLegHash === expectedHash);
     check("confirmSettlement leg received the SAME computeZkProofHash output", confirmLegHash === expectedHash);
     check("both legs received an identical hash (never independently derived)", solanaLegHash === confirmLegHash);
+  }
+
+  console.log("[gate-test] 23) reconciliation: collateral_posted + isAlreadySettled -> confirmSettlement is invoked directly, not just alerted (Gate 5D-resume-fix)");
+  {
+    const intentIdHex = "1a".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
+    markSettled(intentId); // Solana leg already succeeded per the local ledger
+    setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "aa".repeat(32), expiry: json.expiry });
+
+    let confirmCalls = 0;
+    const deps = baseDeps({
+      confirmSettlement: async (_id, _hash, onSigned) => {
+        confirmCalls++;
+        onSigned(("0x" + "ee".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "ee".repeat(32)) as `0x${string}` };
+      },
+    });
+    const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
+    await reconcileArbitrumLedger(deps, fakePublicClient);
+    check("confirmSettlement was invoked directly on reconciliation, not just alerted", confirmCalls === 1);
+    check("ledger stage advanced to confirmed", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
+    check("no alert was recorded for this intent (resumed automatically instead)", !readState(intentId)?.alertReason);
+  }
+
+  console.log("[gate-test] 24) reconciliation: collateral_posted + isAlreadySettled but proof JSON missing -> still only alerts (genuine unhandled case)");
+  {
+    const intentIdHex = "1b".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    markSettled(intentId); // Solana leg already succeeded, but no proof_<id>.json/.bin ever written for this id
+    setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "bb".repeat(32) });
+
+    let confirmCalls = 0;
+    const deps = baseDeps({
+      confirmSettlement: async (_id, _hash, onSigned) => {
+        confirmCalls++;
+        onSigned(("0x" + "ff".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "ff".repeat(32)) as `0x${string}` };
+      },
+    });
+    const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
+    await reconcileArbitrumLedger(deps, fakePublicClient);
+    check("confirmSettlement NOT invoked without a readable proof JSON", confirmCalls === 0);
+    check("ledger stage stays collateral_posted (not silently advanced)", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
+    check("alert recorded instead", !!readState(intentId)?.alertReason?.includes("needs manual review"));
+  }
+
+  console.log("[gate-test] 25) reconciliation: one collateral_posted entry throwing unexpectedly does NOT block the next entry's recovery (Gate 5D-resume-fix-2)");
+  {
+    const throwingIdHex = "1c".repeat(32);
+    const throwingId = ("0x" + throwingIdHex) as `0x${string}`;
+    const okIdHex = "1d".repeat(32);
+    const okId = ("0x" + okIdHex) as `0x${string}`;
+
+    const throwingJson = baseJson(throwingIdHex);
+    const okJson = baseJson(okIdHex);
+    writeFakeProofBin(throwingIdHex);
+    writeFakeProofBin(okIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${throwingIdHex}.json`), JSON.stringify(throwingJson));
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${okIdHex}.json`), JSON.stringify(okJson));
+
+    markSettled(throwingId);
+    markSettled(okId);
+    setArbitrumStage(throwingId, "collateral_posted", { collateralTxHash: "0x" + "cc".repeat(32), expiry: throwingJson.expiry });
+    setArbitrumStage(okId, "collateral_posted", { collateralTxHash: "0x" + "dd".repeat(32), expiry: okJson.expiry });
+
+    let confirmCalls = 0;
+    const deps = baseDeps({
+      readIntent: async (id) => {
+        if (id.toLowerCase() === throwingId.toLowerCase()) {
+          throw new Error("simulated RPC failure reading intent state");
+        }
+        return mockOnChainIntent();
+      },
+      confirmSettlement: async (_id, _hash, onSigned) => {
+        confirmCalls++;
+        onSigned(("0x" + "01".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "01".repeat(32)) as `0x${string}` };
+      },
+    });
+    const fakePublicClient = { getTransactionReceipt: async () => { throw new Error("not found"); } } as unknown as Parameters<typeof reconcileArbitrumLedger>[1];
+
+    let threw = false;
+    try {
+      await reconcileArbitrumLedger(deps, fakePublicClient);
+    } catch {
+      threw = true;
+    }
+    check("reconcileArbitrumLedger itself did not throw", !threw);
+    check("the throwing entry got an alert, not a crash", !!readState(throwingId)?.alertReason?.includes("threw unexpectedly"));
+    check("the throwing entry's ledger stage stays collateral_posted (not silently advanced)", getArbitrumLedgerEntry(throwingId)?.stage === "collateral_posted");
+    check("the NEXT entry was still processed (confirmSettlement invoked despite the first entry's throw)", confirmCalls === 1);
+    check("the next entry's ledger reached confirmed", getArbitrumLedgerEntry(okId)?.stage === "confirmed");
   }
 
   if (failures > 0) {

@@ -31,7 +31,41 @@ function normalizeProofHashHex(input) {
   return stripped.toLowerCase();
 }
 
-module.exports = { weiToLamports, normalizeProofHashHex };
+// Gate 5D-hang: replaces a bare `connection.confirmTransaction(...)` await,
+// which has no timeout of its own — it races a WebSocket signature
+// subscription against internal blockhash-height polling, and if the RPC's
+// WebSocket silently stops delivering (common on public devnet endpoints)
+// while its HTTP polling also stalls (Node's fetch has no default timeout),
+// the promise can hang forever with no error and no resolution. This polls
+// getSignatureStatus on a bounded interval with a hard ceiling (timeoutMs),
+// so the process always terminates — successfully, on an on-chain failure,
+// on blockhash expiry, or on timeout — instead of depending on an unowned
+// network promise. `connection` is taken as a parameter (duck-typed: only
+// getSignatureStatus/getBlockHeight are used) so this is testable with a
+// mock, without touching real Solana RPC — see settle_intent.gate.test.js.
+async function pollForConfirmation(connection, signature, lastValidBlockHeight, options = {}) {
+  const { pollIntervalMs = 2_000, timeoutMs = 90_000 } = options;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { value } = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+    if (value?.err) {
+      throw new Error(`transaction ${signature} failed on-chain: ${JSON.stringify(value.err)}`);
+    }
+    if (value && (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized')) {
+      return;
+    }
+    const height = await connection.getBlockHeight('confirmed');
+    if (height > lastValidBlockHeight) {
+      throw new Error(`blockhash expired before ${signature} confirmed (height ${height} > lastValidBlockHeight ${lastValidBlockHeight})`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${signature} to confirm`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
+module.exports = { weiToLamports, normalizeProofHashHex, pollForConfirmation };
 
 // Everything below only runs when this file is executed directly (`node
 // settle_intent.js`), never on require() — e.g. from a test importing
@@ -249,7 +283,7 @@ async function runSettlement() {
   await waitForGo();
 
   await connection.sendRawTransaction(settleTxObj.serialize(), { skipPreflight: false });
-  await connection.confirmTransaction({ signature: settleTx, blockhash, lastValidBlockHeight }, 'confirmed');
+  await pollForConfirmation(connection, settleTx, lastValidBlockHeight);
 
   console.log('receive_settlement tx:', settleTx);
 

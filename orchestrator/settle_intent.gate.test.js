@@ -6,7 +6,7 @@
 // other gate tests; run with:
 //
 //   node settle_intent.gate.test.js
-const { weiToLamports, normalizeProofHashHex } = require('./settle_intent.js');
+const { weiToLamports, normalizeProofHashHex, pollForConfirmation } = require('./settle_intent.js');
 
 let failures = 0;
 function check(name, cond) {
@@ -120,9 +120,89 @@ console.log('[gate-test] 10) runSettlement refuses to run with an invalid (wrong
   check('clear message naming PROOF_HASH_HEX', result.stderr.includes('PROOF_HASH_HEX'));
 }
 
-if (failures > 0) {
-  console.error(`\n[gate-test] ${failures} check(s) FAILED`);
-  process.exit(1);
-} else {
-  console.log(`\n[gate-test] all checks passed`);
+// Gate 5D-hang: pollForConfirmation replaces a bare confirmTransaction()
+// await that had no timeout of its own (see settle_intent.js). `connection`
+// is duck-typed (only getSignatureStatus/getBlockHeight are called), so it's
+// mocked here directly — no real Solana RPC, no real delay: timeoutMs/
+// pollIntervalMs are passed short so these run in well under a second
+// instead of waiting the real 90s production ceiling.
+async function runAsyncChecks() {
+  console.log('[gate-test] 11) pollForConfirmation: resolves as soon as the signature shows confirmed');
+  {
+    let calls = 0;
+    const fakeConnection = {
+      async getSignatureStatus() {
+        calls++;
+        return { value: { err: null, confirmationStatus: 'confirmed' } };
+      },
+      async getBlockHeight() {
+        throw new Error('should not be reached once confirmed');
+      },
+    };
+    let threw = false;
+    try {
+      await pollForConfirmation(fakeConnection, 'fakeSig123', 1000, { pollIntervalMs: 10, timeoutMs: 200 });
+    } catch {
+      threw = true;
+    }
+    check('resolves without throwing', !threw);
+    check('checked the signature at least once', calls >= 1);
+  }
+
+  console.log('[gate-test] 12) pollForConfirmation: an on-chain error in value.err throws immediately, no polling loop');
+  {
+    let calls = 0;
+    const fakeConnection = {
+      async getSignatureStatus() {
+        calls++;
+        return { value: { err: { InstructionError: [0, 'Custom'] } } };
+      },
+      async getBlockHeight() {
+        throw new Error('should not be reached — err should throw before any height check');
+      },
+    };
+    let error = null;
+    try {
+      await pollForConfirmation(fakeConnection, 'fakeSigErr', 1000, { pollIntervalMs: 10, timeoutMs: 200 });
+    } catch (err) {
+      error = err;
+    }
+    check('threw an error', error !== null);
+    check('threw on the first check (no retrying a failed tx)', calls === 1);
+    check('error message names the signature', error !== null && error.message.includes('fakeSigErr'));
+  }
+
+  console.log('[gate-test] 13) pollForConfirmation: never confirms -> times out at the configured ceiling and throws (short ceiling, not the real 90s)');
+  {
+    let calls = 0;
+    const start = Date.now();
+    const fakeConnection = {
+      async getSignatureStatus() {
+        calls++;
+        return { value: { err: null, confirmationStatus: 'processed' } }; // never confirmed/finalized
+      },
+      async getBlockHeight() {
+        return 1; // well under lastValidBlockHeight — never triggers the blockhash-expiry path
+      },
+    };
+    let error = null;
+    try {
+      await pollForConfirmation(fakeConnection, 'fakeSigHang', 1_000_000, { pollIntervalMs: 20, timeoutMs: 100 });
+    } catch (err) {
+      error = err;
+    }
+    const elapsed = Date.now() - start;
+    check('threw a timeout error', error !== null && /timed out/.test(error.message));
+    check('polled more than once before giving up', calls > 1);
+    check('gave up at roughly the configured ceiling, not instantly and not 90s', elapsed >= 90 && elapsed < 5000);
+  }
 }
+
+runAsyncChecks().then(() => {
+  if (failures > 0) {
+    console.error(`\n[gate-test] ${failures} check(s) FAILED`);
+    process.exit(1);
+  } else {
+    console.log(`\n[gate-test] all checks passed`);
+  }
+});

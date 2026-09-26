@@ -251,7 +251,7 @@ function lastStderrLine(stderrTail: string): string {
   return lines.length > 0 ? lines[lines.length - 1] : "";
 }
 
-function readProofJson(intentIdHex: string): ProofOutputJson | null {
+export function readProofJson(intentIdHex: string): ProofOutputJson | null {
   const jsonPath = path.join(ZK_DIR, `proof_${intentIdHex}.json`);
   const binPath = path.join(ZK_DIR, `proof_${intentIdHex}.bin`);
   if (!fs.existsSync(jsonPath) || !fs.existsSync(binPath)) {

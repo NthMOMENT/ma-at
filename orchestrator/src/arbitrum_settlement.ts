@@ -18,7 +18,7 @@ import type { ProofOutputJson } from "./prover_pipeline";
 import { ZK_DIR, alert } from "./prover_pipeline";
 import { recordAlertReason, setArbitrumSettlement, type ArbitrumSettlementStage } from "./intent_state";
 import { setArbitrumStage, getArbitrumLedgerEntry, getMidSequenceEntries, getAwaitingExpirySlashEntries, getCollateralPostedEntries } from "./arbitrum_ledger";
-import { isAlreadySettled } from "./prover_pipeline";
+import { isAlreadySettled, readProofJson } from "./prover_pipeline";
 import { redact } from "./redact";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -573,18 +573,45 @@ export async function reconcileArbitrumLedger(deps: ArbitrumSettlementDeps, publ
   // "collateral_posted" is a stable-looking intermediate stage (no tx
   // in flight), so it's not in getMidSequenceEntries() above — but if the
   // process crashed between the Solana payout succeeding and
-  // confirmSettlement ever being attempted, it's just as stuck. Flagged for
-  // manual follow-up rather than auto-resumed: re-entering
-  // runArbitrumSettlementSequence from here would need to skip steps 1-3,
-  // which the current linear sequence doesn't support, and resuming a
-  // multi-step onchain sequence unattended after an unknown-duration outage
-  // is exactly the kind of ambiguous case this codebase prefers to surface
-  // loudly (see setUnconfirmedNeedsReview's equivalent choice for the Solana
-  // leg) rather than silently guess its way through.
+  // confirmSettlement ever being attempted, it's just as stuck. Gate
+  // 5D-resume-fix: when the Solana leg already succeeded (isAlreadySettled),
+  // there is nothing ambiguous left to resume — steps 1-3 of
+  // runArbitrumSettlementSequence are done (collateral posted, on-chain
+  // solver/status checked, Solana payout confirmed), so this calls
+  // confirmSettlementWithRetry directly for step 4 instead of only alerting.
+  // confirmSettlementWithRetry itself re-reads intents(id) on-chain before
+  // every attempt (including the first), so a Slashed/Refunded/Settled
+  // intent is still handled safely, not blindly re-sent. The alert path is
+  // kept only for a genuine unhandled case: the proof JSON/bin this needs
+  // (json.expiry, the zkProofHash) is missing or unreadable, which nothing
+  // here can safely guess its way around.
   for (const { intentId, entry } of getCollateralPostedEntries()) {
     const id = (`0x${intentId}`) as `0x${string}`;
-    if (isAlreadySettled(id)) {
-      const reason = `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but confirmSettlement was never attempted (process restart mid-sequence) — needs manual resumption`;
+    if (!isAlreadySettled(id)) continue;
+
+    // Gate 5D-resume-fix-2: this whole per-entry body is wrapped so ANY
+    // unexpected throw — readProofJson itself never throws (missing/corrupt
+    // file returns null, handled below), but computeZkProofHash reads a file
+    // too (TOCTOU: it can vanish/become unreadable between readProofJson's
+    // existsSync check and here) and confirmSettlementWithRetry calls
+    // deps.readIntent, an unguarded RPC call that can throw on a real
+    // network failure — turns into an alert for THIS intent and moves on to
+    // the next entry, instead of aborting the whole reconciliation loop and
+    // silently skipping every other intent's boot recovery behind it.
+    try {
+      const json = readProofJson(intentId);
+      if (!json) {
+        const reason = `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but proof_${intentId}.json is missing/invalid — cannot resume confirmSettlement automatically, needs manual review`;
+        alert(`intent ${id}: ${reason}`);
+        recordAlertReason(id, reason);
+        continue;
+      }
+
+      const zkProofHash = computeZkProofHash(intentId);
+      console.log(`[ARB-SETTLE] boot reconciliation: intent ${id} is collateral_posted with the Solana payout already settled — resuming confirmSettlement.`);
+      await confirmSettlementWithRetry(deps, id, json, zkProofHash);
+    } catch (err) {
+      const reason = `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but resuming confirmSettlement threw unexpectedly (${(err as Error).message}) — needs manual review; other intents' boot reconciliation is unaffected`;
       alert(`intent ${id}: ${reason}`);
       recordAlertReason(id, reason);
     }
