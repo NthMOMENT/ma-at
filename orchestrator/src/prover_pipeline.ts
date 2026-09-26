@@ -206,9 +206,18 @@ export interface SettlingReconcileDeps {
 /// repeatedly/periodically instead: an entry that resolves to "settled"
 /// leaves getSettlingEntries()'s result set for good and is never touched
 /// again; one that's still ambiguous is simply re-checked next time.
-export async function reconcileSettlingLedger(deps: SettlingReconcileDeps): Promise<void> {
+///
+/// Gate 5D-wire-periodic-to-arbitrum: returns every intentId this call
+/// itself just flipped to "settled" (never ones settled by an earlier call)
+/// — this module has no business knowing about the Arbitrum-side resume
+/// (importing arbitrum_settlement.ts here would be circular, since that
+/// module already imports from this one), so the caller (listener.ts) is
+/// the one that reacts to a freshly-settled intent by triggering
+/// resumeCollateralPostedIntent for it.
+export async function reconcileSettlingLedger(deps: SettlingReconcileDeps): Promise<string[]> {
   const pending = getSettlingEntries();
-  if (pending.length === 0) return;
+  const newlySettled: string[] = [];
+  if (pending.length === 0) return newlySettled;
 
   for (const { intentId, solanaSig } of pending) {
     try {
@@ -218,6 +227,7 @@ export async function reconcileSettlingLedger(deps: SettlingReconcileDeps): Prom
         setSettled(intentId, solanaSig);
         alreadyAlertedSettlingSigs.delete(solanaSig);
         console.log(`[LEDGER] intent 0x${intentId}: sig ${solanaSig} landed on-chain — marked settled.`);
+        newlySettled.push(intentId);
       } else if (!alreadyAlertedSettlingSigs.has(solanaSig)) {
         alreadyAlertedSettlingSigs.add(solanaSig);
         const reason =
@@ -233,6 +243,7 @@ export async function reconcileSettlingLedger(deps: SettlingReconcileDeps): Prom
       recordAlertReason(intentId, reason);
     }
   }
+  return newlySettled;
 }
 
 // ─── Prover invocation ────────────────────────────────────────────────────────

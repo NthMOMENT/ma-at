@@ -41,7 +41,7 @@ import {
   isBlockFinal,
   setFinal,
 } from "./intent_state";
-import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, type SolanaPayoutResult } from "./arbitrum_settlement";
+import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, resumeCollateralPostedIntent, type SolanaPayoutResult } from "./arbitrum_settlement";
 import { redactError } from "./redact";
 import { createRotatingHttpTransport } from "./rpc_rotation";
 
@@ -445,6 +445,17 @@ async function runSolanaPayout(intentId: string, json: ProofOutputJson, payoutDe
   });
 }
 
+// Gate 5D-race-fix-2 / Gate 5D-wire-periodic-to-arbitrum: builds the REAL,
+// per-intent runSolanaPayout that reconcileArbitrumLedger's (boot) and
+// resumeCollateralPostedIntent's (periodic) "collateral_posted, Solana leg
+// never started" resume path needs — never reconciliationDeps.runSolanaPayout,
+// which is a shared throwing stub (see reconciliationDeps's own doc comment
+// above). Shared by both call sites below so they resume identically.
+function buildRunSolanaPayoutForResume(intentId: `0x${string}`, json: ProofOutputJson): (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult> {
+  const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
+  return (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash);
+}
+
 // ─── Event handlers ────────────────────────────────────────────────────────────
 
 function logIntentCreated(log: Log, chainLabel: string): void {
@@ -659,10 +670,7 @@ async function main(): Promise<void> {
   // SAME real runSolanaPayout triggerZKVerification uses, wired to that
   // entry's own intentId/json, exactly once per entry — never touching the
   // shared stub.
-  await reconcileArbitrumLedger(reconciliationDeps, arbClient, (intentId, json) => {
-    const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
-    return (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash);
-  });
+  await reconcileArbitrumLedger(reconciliationDeps, arbClient, buildRunSolanaPayoutForResume);
 
   try {
     const arbBlock = await arbClient.getBlockNumber();
@@ -709,8 +717,27 @@ async function main(): Promise<void> {
 
   // Gate 5D-slash-fix: periodic, not just boot-once — see
   // SETTLING_RECONCILE_INTERVAL_MS's doc comment above.
+  //
+  // Gate 5D-wire-periodic-to-arbitrum: reconcileSettlingLedger marking a
+  // Solana signature settled mid-run is only half the fix — the intent's
+  // Arbitrum-side ledger entry can still be sitting at "collateral_posted"
+  // with no confirmTxHash, and previously only a full process restart (via
+  // boot's reconcileArbitrumLedger, above) ever revisited that. Every
+  // intentId this call JUST flipped to settled gets its Arbitrum side
+  // resumed immediately via resumeCollateralPostedIntent — the exact same
+  // per-intent logic boot reconciliation runs for every collateral_posted
+  // entry it finds — so a full end-to-end run completes without ever
+  // needing a restart.
   setInterval(() => {
-    reconcileSettlingLedger({ checkSolanaSignatureLanded }).catch((err) => logError("[LEDGER] periodic reconciliation failed:", err));
+    reconcileSettlingLedger({ checkSolanaSignatureLanded })
+      .then((newlySettled) => {
+        for (const intentId of newlySettled) {
+          resumeCollateralPostedIntent(reconciliationDeps, intentId as `0x${string}`, buildRunSolanaPayoutForResume).catch((err) =>
+            logError(`[LEDGER] intent ${intentId}: Arbitrum-side resume after periodic reconciliation failed:`, err)
+          );
+        }
+      })
+      .catch((err) => logError("[LEDGER] periodic reconciliation failed:", err));
   }, SETTLING_RECONCILE_INTERVAL_MS);
 
   console.log("\n[Orchestrator] Listening. Waiting for intents...\n");

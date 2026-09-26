@@ -59,6 +59,7 @@ import {
   confirmSettlementWithRetry,
   pollAwaitingSlash,
   reconcileArbitrumLedger,
+  resumeCollateralPostedIntent,
   INTENT_STATUS_PENDING,
   INTENT_STATUS_SLASHED,
   INTENT_STATUS_SETTLED,
@@ -69,7 +70,7 @@ import {
 } from "./arbitrum_settlement";
 import { getArbitrumLedgerEntry, setArbitrumStage } from "./arbitrum_ledger";
 import { readState } from "./intent_state";
-import { markSettled, markSettling, getLedgerEntry, type ProofOutputJson } from "./prover_pipeline";
+import { markSettled, markSettling, getLedgerEntry, reconcileSettlingLedger, type ProofOutputJson } from "./prover_pipeline";
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -950,6 +951,66 @@ async function main(): Promise<void> {
     check("reconcileArbitrumLedger did not throw even with no buildRunSolanaPayout given", !threw);
     check("ledger stays at collateral_posted (not silently advanced, not crashed)", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
     check("alert recorded explaining reconciliation has no way to run the Solana leg", !!readState(intentId)?.alertReason?.includes("no way to run it"));
+  }
+
+  console.log("[gate-test] 29) resumeCollateralPostedIntent: no-ops for an intent that isn't (or is no longer) sitting at collateral_posted");
+  {
+    const intentIdHex = "21".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    setArbitrumStage(intentId, "confirming", { confirmTxHash: "0x" + "aa".repeat(32) });
+
+    let confirmCalls = 0;
+    const deps = baseDeps({ confirmSettlement: async (_id, _hash, onSigned) => { confirmCalls++; onSigned(("0x" + "bb".repeat(32)) as `0x${string}`); return { ok: true }; } });
+    await resumeCollateralPostedIntent(deps, intentId);
+    check("nothing was resumed for a non-collateral_posted stage", confirmCalls === 0);
+    check("ledger stage untouched", getArbitrumLedgerEntry(intentId)?.stage === "confirming");
+
+    await resumeCollateralPostedIntent(deps, ("0x" + "22".repeat(32)) as `0x${string}`); // no ledger entry at all
+    check("nothing was resumed for an intent with no ledger entry either", confirmCalls === 0);
+  }
+
+  console.log(
+    "[gate-test] 30) Gate 5D-wire-periodic-to-arbitrum: the periodic reconciler (reconcileSettlingLedger) settling an intent MID-RUN immediately triggers the Arbitrum-side resume for that intent — no restart, no boot-only reconcileArbitrumLedger call involved"
+  );
+  {
+    const intentIdHex = "22".repeat(32);
+    const intentId = ("0x" + intentIdHex) as `0x${string}`;
+    const json = baseJson(intentIdHex);
+    writeFakeProofBin(intentIdHex);
+    fs.writeFileSync(path.join(process.env.ZK_DIR_PATH as string, `proof_${intentIdHex}.json`), JSON.stringify(json));
+
+    // Mirrors the real shape: a Solana payout was signed (markSettling), the
+    // Arbitrum side already got as far as collateral_posted, and the process
+    // is waiting on both. This is exactly the "sat at collateral_posted with
+    // no confirmTxHash" incident from the gap report.
+    markSettling(intentId, "sig-lands-mid-run");
+    setArbitrumStage(intentId, "collateral_posted", { collateralTxHash: "0x" + "aa".repeat(32), expiry: json.expiry });
+
+    let confirmCalls = 0;
+    const deps = baseDeps({
+      confirmSettlement: async (_id, _hash, onSigned) => {
+        confirmCalls++;
+        onSigned(("0x" + "cc".repeat(32)) as `0x${string}`);
+        return { ok: true, txHash: ("0x" + "cc".repeat(32)) as `0x${string}` };
+      },
+    });
+
+    // The periodic pass itself (listener.ts's setInterval): the signature
+    // lands, right now, mid-run.
+    const newlySettled = await reconcileSettlingLedger({ checkSolanaSignatureLanded: async (sig) => sig === "sig-lands-mid-run" });
+    check("reconcileSettlingLedger reports this intent as newly settled", newlySettled.map((id) => id.toLowerCase()).includes(intentId.toLowerCase()));
+    check("ledger entry marked settled by the periodic pass", getLedgerEntry(intentId)?.status === "settled");
+    check("Arbitrum ledger has NOT advanced yet — this is exactly the gap the fix closes", getArbitrumLedgerEntry(intentId)?.stage === "collateral_posted");
+
+    // listener.ts's fix: for every newly-settled id, resume the Arbitrum side
+    // immediately — no restart, no reconcileArbitrumLedger boot sweep.
+    for (const id of newlySettled) {
+      await resumeCollateralPostedIntent(deps, id as `0x${string}`);
+    }
+
+    check("confirmSettlement was invoked right after periodic settlement, without any restart", confirmCalls === 1);
+    check("Arbitrum ledger advanced all the way to confirmed", getArbitrumLedgerEntry(intentId)?.stage === "confirmed");
+    check("no alert was recorded (resumed automatically instead of needing manual review)", !readState(intentId)?.alertReason);
   }
 
   if (failures > 0) {

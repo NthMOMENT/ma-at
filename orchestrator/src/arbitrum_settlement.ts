@@ -622,6 +622,72 @@ export async function pollAwaitingSlash(deps: ArbitrumSettlementDeps): Promise<v
 // would revert (SolverAlreadyPosted) at best or double-spend collateral at
 // worst if some future version relaxed that guard.
 
+/// Per-intent version of the "collateral_posted" resume logic inside
+/// reconcileArbitrumLedger below — looks up the ledger entry itself and
+/// no-ops if this intent isn't (or is no longer) sitting at
+/// collateral_posted, so a caller can invoke it unconditionally for any
+/// intent without first checking that itself. Gate 5D-wire-periodic-to-arbitrum:
+/// this is what lets a Solana signature landing SIDE the periodic
+/// reconcileSettlingLedger pass (prover_pipeline.ts) — not just at boot —
+/// immediately resume the Arbitrum side for that one intent, instead of
+/// leaving a collateral_posted entry stuck until the next process restart.
+/// Same logic reconcileArbitrumLedger's boot pass runs for every
+/// collateral_posted entry it finds — factored out here so both call sites
+/// share one implementation.
+export async function resumeCollateralPostedIntent(
+  deps: ArbitrumSettlementDeps,
+  intentId: `0x${string}`,
+  buildRunSolanaPayout?: (intentId: `0x${string}`, json: ProofOutputJson) => (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult>
+): Promise<void> {
+  const intentIdHex = intentId.replace(/^0x/i, "").toLowerCase();
+  const entry = getArbitrumLedgerEntry(intentIdHex);
+  if (!entry || entry.stage !== "collateral_posted") return; // nothing to resume right now
+  const id = (`0x${intentIdHex}`) as `0x${string}`;
+  const alreadySettled = isAlreadySettled(id);
+
+  // Gate 5D-resume-fix-2: wrapped so ANY unexpected throw (a vanished/
+  // unreadable proof file, an RPC failure inside confirmSettlementWithRetry
+  // or resumeArbitrumSettlementFromCollateralPosted) turns into an alert for
+  // THIS intent rather than propagating to the caller and, for the periodic
+  // reconciliation pass, potentially breaking that pass for every other
+  // intent behind it.
+  try {
+    const json = readProofJson(intentIdHex);
+    if (!json) {
+      const reason = alreadySettled
+        ? `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but proof_${intentIdHex}.json is missing/invalid — cannot resume confirmSettlement automatically, needs manual review`
+        : `collateral posted (tx ${entry.collateralTxHash}) but proof_${intentIdHex}.json is missing/invalid — cannot resume the settlement sequence automatically, needs manual review`;
+      alert(`intent ${id}: ${reason}`);
+      recordAlertReason(id, reason);
+      return;
+    }
+
+    if (alreadySettled) {
+      const zkProofHash = computeZkProofHash(intentIdHex);
+      console.log(`[ARB-SETTLE] intent ${id} is collateral_posted with the Solana payout already settled — resuming confirmSettlement.`);
+      await confirmSettlementWithRetry(deps, id, json, zkProofHash);
+    } else if (buildRunSolanaPayout) {
+      // A real, per-intent runSolanaPayout — NOT the shared deps.runSolanaPayout
+      // stub, which throws by design (see reconcileArbitrumLedger's own doc
+      // comment below): this entry's Solana leg is a function of ITS OWN
+      // intentId/json, which only the caller (listener.ts) can decode.
+      const resumeDeps: ArbitrumSettlementDeps = { ...deps, runSolanaPayout: buildRunSolanaPayout(id, json) };
+      console.log(`[ARB-SETTLE] intent ${id} is collateral_posted but never got past the on-chain check — resuming from Step 2.`);
+      await resumeArbitrumSettlementFromCollateralPosted(resumeDeps, id, json);
+    } else {
+      const reason = `collateral posted (tx ${entry.collateralTxHash}) but the Solana leg was never started, and this reconciliation pass has no way to run it (no buildRunSolanaPayout provided) — needs manual review`;
+      alert(`intent ${id}: ${reason}`);
+      recordAlertReason(id, reason);
+    }
+  } catch (err) {
+    const reason = alreadySettled
+      ? `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but resuming confirmSettlement threw unexpectedly (${(err as Error).message}) — needs manual review; other intents' reconciliation is unaffected`
+      : `collateral posted (tx ${entry.collateralTxHash}), but resuming the settlement sequence threw unexpectedly (${(err as Error).message}) — needs manual review; other intents' reconciliation is unaffected`;
+    alert(`intent ${id}: ${reason}`);
+    recordAlertReason(id, reason);
+  }
+}
+
 export async function reconcileArbitrumLedger(
   deps: ArbitrumSettlementDeps,
   publicClient: PublicClient,
@@ -738,53 +804,12 @@ export async function reconcileArbitrumLedger(
   // for a genuine unhandled case: the proof JSON/bin this needs (json.expiry,
   // the zkProofHash) is missing or unreadable, which nothing here can safely
   // guess its way around.
-  for (const { intentId, entry } of getCollateralPostedEntries()) {
-    const id = (`0x${intentId}`) as `0x${string}`;
-    const alreadySettled = isAlreadySettled(id);
-
-    // Gate 5D-resume-fix-2: this whole per-entry body is wrapped so ANY
-    // unexpected throw — readProofJson itself never throws (missing/corrupt
-    // file returns null, handled below), but computeZkProofHash reads a file
-    // too (TOCTOU: it can vanish/become unreadable between readProofJson's
-    // existsSync check and here) and the RPC calls inside are unguarded and
-    // can throw on a real network failure — turns into an alert for THIS
-    // intent and moves on to the next entry, instead of aborting the whole
-    // reconciliation loop and silently skipping every other intent's boot
-    // recovery behind it.
-    try {
-      const json = readProofJson(intentId);
-      if (!json) {
-        const reason = alreadySettled
-          ? `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but proof_${intentId}.json is missing/invalid — cannot resume confirmSettlement automatically, needs manual review`
-          : `collateral posted (tx ${entry.collateralTxHash}) but proof_${intentId}.json is missing/invalid — cannot resume the settlement sequence automatically, needs manual review`;
-        alert(`intent ${id}: ${reason}`);
-        recordAlertReason(id, reason);
-        continue;
-      }
-
-      if (alreadySettled) {
-        const zkProofHash = computeZkProofHash(intentId);
-        console.log(`[ARB-SETTLE] boot reconciliation: intent ${id} is collateral_posted with the Solana payout already settled — resuming confirmSettlement.`);
-        await confirmSettlementWithRetry(deps, id, json, zkProofHash);
-      } else if (buildRunSolanaPayout) {
-        // A real, per-intent runSolanaPayout — NOT the shared deps.runSolanaPayout
-        // stub, which throws by design (see reconcileArbitrumLedger's own
-        // doc comment above): this entry's Solana leg is a function of ITS
-        // OWN intentId/json, which only the caller (listener.ts) can decode.
-        const resumeDeps: ArbitrumSettlementDeps = { ...deps, runSolanaPayout: buildRunSolanaPayout(id, json) };
-        console.log(`[ARB-SETTLE] boot reconciliation: intent ${id} is collateral_posted but never got past the on-chain check — resuming from Step 2.`);
-        await resumeArbitrumSettlementFromCollateralPosted(resumeDeps, id, json);
-      } else {
-        const reason = `collateral posted (tx ${entry.collateralTxHash}) but the Solana leg was never started, and this reconciliation pass has no way to run it (no buildRunSolanaPayout provided) — needs manual review`;
-        alert(`intent ${id}: ${reason}`);
-        recordAlertReason(id, reason);
-      }
-    } catch (err) {
-      const reason = alreadySettled
-        ? `collateral posted (tx ${entry.collateralTxHash}) and the Solana payout already succeeded, but resuming confirmSettlement threw unexpectedly (${(err as Error).message}) — needs manual review; other intents' boot reconciliation is unaffected`
-        : `collateral posted (tx ${entry.collateralTxHash}), but resuming the settlement sequence threw unexpectedly (${(err as Error).message}) — needs manual review; other intents' boot reconciliation is unaffected`;
-      alert(`intent ${id}: ${reason}`);
-      recordAlertReason(id, reason);
-    }
+  // Gate 5D-wire-periodic-to-arbitrum: this per-entry resume logic now lives
+  // in resumeCollateralPostedIntent (above) — shared with the periodic
+  // reconcileSettlingLedger pass (prover_pipeline.ts, wired via listener.ts),
+  // which needs the exact same behavior for one specific intent the moment
+  // its Solana signature lands mid-run, not just for every entry at boot.
+  for (const { intentId } of getCollateralPostedEntries()) {
+    await resumeCollateralPostedIntent(deps, (`0x${intentId}`) as `0x${string}`, buildRunSolanaPayout);
   }
 }
