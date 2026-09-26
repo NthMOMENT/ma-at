@@ -16,3 +16,4 @@ zk/proof_*.bin
 zk/proof_*.json
 zk/exec_*.json
 zk/*.tmp
+zk/.rpc_health.json

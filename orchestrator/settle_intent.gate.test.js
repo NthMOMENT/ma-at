@@ -6,7 +6,7 @@
 // other gate tests; run with:
 //
 //   node settle_intent.gate.test.js
-const { weiToLamports, normalizeProofHashHex, pollForConfirmation } = require('./settle_intent.js');
+const { weiToLamports, normalizeProofHashHex, pollForConfirmation, withTimeout } = require('./settle_intent.js');
 
 let failures = 0;
 function check(name, cond) {
@@ -195,6 +195,58 @@ async function runAsyncChecks() {
     check('threw a timeout error', error !== null && /timed out/.test(error.message));
     check('polled more than once before giving up', calls > 1);
     check('gave up at roughly the configured ceiling, not instantly and not 90s', elapsed >= 90 && elapsed < 5000);
+  }
+
+  // Gate 5D-hang-3: getSignatureStatus mocked to hang forever (a promise that
+  // never resolves, simulating a stalled network call) — pollForConfirmation
+  // must still throw within its rpcTimeoutMs bound instead of hanging for
+  // the full 90s ceiling (or forever).
+  console.log('[gate-test] 14) pollForConfirmation: a getSignatureStatus call that never resolves throws within rpcTimeoutMs, doesn\'t hang');
+  {
+    let calls = 0;
+    const fakeConnection = {
+      async getSignatureStatus() {
+        calls++;
+        return new Promise(() => {}); // never resolves — simulates a stalled RPC call
+      },
+      async getBlockHeight() {
+        throw new Error('should not be reached — the stalled getSignatureStatus call should throw first');
+      },
+    };
+    const start = Date.now();
+    let error = null;
+    try {
+      await pollForConfirmation(fakeConnection, 'fakeSigStall', 1000, {
+        pollIntervalMs: 10,
+        timeoutMs: 5_000, // outer ceiling well above rpcTimeoutMs, so a pass here proves the per-call timeout fired, not the outer one
+        rpcTimeoutMs: 50,
+      });
+    } catch (err) {
+      error = err;
+    }
+    const elapsed = Date.now() - start;
+    check('threw an error', error !== null);
+    check('error names the stalled call', error !== null && /getSignatureStatus/.test(error.message));
+    check('threw on the first call (no retry inside pollForConfirmation itself)', calls === 1);
+    check('threw at roughly rpcTimeoutMs, not the 5s outer ceiling', elapsed >= 50 && elapsed < 4000);
+  }
+
+  console.log('[gate-test] 15) withTimeout: resolves normally when the wrapped promise settles first');
+  {
+    const result = await withTimeout(Promise.resolve('ok'), 1000, 'quick call');
+    check('result passed through', result === 'ok');
+  }
+
+  console.log('[gate-test] 16) withTimeout: rejects with a labeled error when the wrapped promise never settles');
+  {
+    let error = null;
+    try {
+      await withTimeout(new Promise(() => {}), 30, 'stalled call');
+    } catch (err) {
+      error = err;
+    }
+    check('threw', error !== null);
+    check('error message includes the label and timeout', error !== null && /stalled call timed out after 30ms/.test(error.message));
   }
 }
 

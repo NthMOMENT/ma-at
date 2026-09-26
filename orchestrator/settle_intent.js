@@ -31,6 +31,18 @@ function normalizeProofHashHex(input) {
   return stripped.toLowerCase();
 }
 
+// Gate 5D-hang-3: races any promise against a timer so a call that never
+// settles (Node's fetch has no default timeout) throws instead of blocking
+// forever. Clears the timer on either outcome so a fast call doesn't leave a
+// dangling timeout handle behind.
+function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // Gate 5D-hang: replaces a bare `connection.confirmTransaction(...)` await,
 // which has no timeout of its own — it races a WebSocket signature
 // subscription against internal blockhash-height polling, and if the RPC's
@@ -43,18 +55,31 @@ function normalizeProofHashHex(input) {
 // network promise. `connection` is taken as a parameter (duck-typed: only
 // getSignatureStatus/getBlockHeight are used) so this is testable with a
 // mock, without touching real Solana RPC — see settle_intent.gate.test.js.
+//
+// Gate 5D-hang-3: the `deadline` check above only runs *between* iterations
+// of the loop — it never protects against the individual
+// getSignatureStatus/getBlockHeight call itself hanging. That's exactly what
+// happened live: one bare await stalled on a bad network call and the loop
+// never got back around to checking `deadline`, sleeping ~19 minutes. Each
+// call inside the loop is now wrapped in withTimeout (rpcTimeoutMs, default
+// 15s) so a stalled call throws and is caught by the existing catch-and-retry
+// path in the caller instead of blocking indefinitely.
 async function pollForConfirmation(connection, signature, lastValidBlockHeight, options = {}) {
-  const { pollIntervalMs = 2_000, timeoutMs = 90_000 } = options;
+  const { pollIntervalMs = 2_000, timeoutMs = 90_000, rpcTimeoutMs = 15_000 } = options;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const { value } = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+    const { value } = await withTimeout(
+      connection.getSignatureStatus(signature, { searchTransactionHistory: true }),
+      rpcTimeoutMs,
+      `getSignatureStatus(${signature})`
+    );
     if (value?.err) {
       throw new Error(`transaction ${signature} failed on-chain: ${JSON.stringify(value.err)}`);
     }
     if (value && (value.confirmationStatus === 'confirmed' || value.confirmationStatus === 'finalized')) {
       return;
     }
-    const height = await connection.getBlockHeight('confirmed');
+    const height = await withTimeout(connection.getBlockHeight('confirmed'), rpcTimeoutMs, 'getBlockHeight');
     if (height > lastValidBlockHeight) {
       throw new Error(`blockhash expired before ${signature} confirmed (height ${height} > lastValidBlockHeight ${lastValidBlockHeight})`);
     }
@@ -65,7 +90,7 @@ async function pollForConfirmation(connection, signature, lastValidBlockHeight, 
   }
 }
 
-module.exports = { weiToLamports, normalizeProofHashHex, pollForConfirmation };
+module.exports = { weiToLamports, normalizeProofHashHex, pollForConfirmation, withTimeout };
 
 // Everything below only runs when this file is executed directly (`node
 // settle_intent.js`), never on require() — e.g. from a test importing
@@ -209,8 +234,13 @@ async function runSettlement() {
   );
   console.log('Circuit breaker PDA:', circuitBreakerPda.toBase58());
 
+  // Gate 5D-hang-3: same bounded-timeout treatment as pollForConfirmation's
+  // internal RPC calls, applied to every other bare `await connection.*` in
+  // this function — none of them has a timeout of its own either.
+  const RPC_TIMEOUT_MS = 15_000;
+
   // Check destination balance before
-  const balanceBefore = await connection.getBalance(DESTINATION);
+  const balanceBefore = await withTimeout(connection.getBalance(DESTINATION), RPC_TIMEOUT_MS, 'getBalance(before)');
   console.log('\nDestination balance before:', balanceBefore / 1e9, 'SOL');
 
   // Step 1: submit_intent — escrow SOL into the intent PDA
@@ -272,7 +302,11 @@ async function runSettlement() {
     })
     .transaction();
 
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  const { blockhash, lastValidBlockHeight } = await withTimeout(
+    connection.getLatestBlockhash('confirmed'),
+    RPC_TIMEOUT_MS,
+    'getLatestBlockhash'
+  );
   settleTxObj.recentBlockhash = blockhash;
   settleTxObj.feePayer = hotWallet.publicKey;
   settleTxObj.sign(hotWallet);
@@ -282,13 +316,17 @@ async function runSettlement() {
 
   await waitForGo();
 
-  await connection.sendRawTransaction(settleTxObj.serialize(), { skipPreflight: false });
+  await withTimeout(
+    connection.sendRawTransaction(settleTxObj.serialize(), { skipPreflight: false }),
+    RPC_TIMEOUT_MS,
+    'sendRawTransaction'
+  );
   await pollForConfirmation(connection, settleTx, lastValidBlockHeight);
 
   console.log('receive_settlement tx:', settleTx);
 
   // Check destination balance after
-  const balanceAfter = await connection.getBalance(DESTINATION);
+  const balanceAfter = await withTimeout(connection.getBalance(DESTINATION), RPC_TIMEOUT_MS, 'getBalance(after)');
   console.log('\nDestination balance after: ', balanceAfter / 1e9, 'SOL');
   console.log('Delta:                  +', (balanceAfter - balanceBefore) / 1e9, 'SOL');
   console.log('\n✓ FULL CIRCLE COMPLETE');
