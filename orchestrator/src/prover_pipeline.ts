@@ -226,20 +226,20 @@ export async function reconcileSettlingLedger(deps: SettlingReconcileDeps): Prom
         markSettled(intentId);
         setSettled(intentId, solanaSig);
         alreadyAlertedSettlingSigs.delete(solanaSig);
-        console.log(`[LEDGER] intent 0x${intentId}: sig ${solanaSig} landed on-chain — marked settled.`);
+        console.log(`[LEDGER] intent ${intentId}: sig ${solanaSig} landed on-chain — marked settled.`);
         newlySettled.push(intentId);
       } else if (!alreadyAlertedSettlingSigs.has(solanaSig)) {
         alreadyAlertedSettlingSigs.add(solanaSig);
         const reason =
           `still "settling" (sig ${solanaSig}) with no confirmed landing on Solana — NOT auto-resettling. Needs manual review; ` +
           `will keep re-checking automatically until it lands or the intent is otherwise resolved.`;
-        alert(`intent 0x${intentId}: ${reason}`);
+        alert(`intent ${intentId}: ${reason}`);
         setUnconfirmedNeedsReview(intentId, solanaSig);
         recordAlertReason(intentId, reason);
       }
     } catch (err) {
       const reason = `failed to check signature ${solanaSig} on Solana during reconciliation: ${(err as Error).message} — NOT auto-resettling.`;
-      alert(`intent 0x${intentId}: ${reason}`);
+      alert(`intent ${intentId}: ${reason}`);
       recordAlertReason(intentId, reason);
     }
   }
