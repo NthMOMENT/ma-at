@@ -15,8 +15,9 @@ Maat is a cross-chain intent protocol. A user signs one transaction on the sourc
   - 107,832 zkVM cycles per proof.
   - ~7 minutes and ~14 GB RAM per proof on the SP1 CPU prover (4-vCPU VPS).
   - Tampering tests: altered amount, wrong contract, a real log from a different contract with the same event signature, altered header, and altered receipt all fail.
+- **Solver collateral (v2):** an approved solver posts 150% collateral before a payout, and gets it back in full on successful settlement. A solver that fails to deliver before expiry is slashed: the user's escrow is refunded and the solver's collateral is forfeited.
 - **Settlement gate (orchestrator):** a payout is sent only if all six checks pass: emitting contract is the deployed `IntentManager`; the proven block hash matches the canonical hash at that height (fresh RPC call); verification key matches; intent not already settled; destination chain is Solana; intent not expired.
-- **Crash-safe settlement ledger:** the Solana signature is recorded before broadcast; on restart, in-flight settlements are checked by signature, never blindly re-sent.
+- **Crash-safe settlement ledger:** the Solana signature is recorded before broadcast; on restart, in-flight settlements are checked by signature, never blindly re-sent. The Arbitrum-side sequence (collateral → payout → confirm) is independently reconciled the same way.
 - **Live dashboard:** [ma-at.xyz/proof](https://ma-at.xyz/proof) shows each intent's proof status, block, settlement signature, and finality.
 
 ## Trust model today
@@ -27,7 +28,7 @@ Maat is a cross-chain intent protocol. A user signs one transaction on the sourc
 | That block is canonical Arbitrum | Checked by the orchestrator against RPC | Self-hosted, self-validating nodes; ZK light client |
 | L1 finality of that block | Arbitrum `finalized` tag via RPC, shown on the dashboard (not ZK) | ZK finality (e.g. SP1-Helios + Arbitrum batch proof) |
 | Settlement on Solana | Sent by the orchestrator after the off-chain settle gate; the Solana program does not verify the proof yet | On-chain Groth16 verification on Solana |
-| Double-settle protection | Orchestrator ledger | On-chain replay protection in the Solana program |
+| Double-settle protection | On-chain status latch on Arbitrum (each intent is a one-way `Pending → {Settled\|Slashed\|Refunded\|Expired}` transition, independently audited); orchestrator ledger on the Solana leg | On-chain replay protection on the Solana program too |
 | Solver credit scoring | Designed, not yet implemented | Next milestone |
 
 ## Known limitations
@@ -37,20 +38,19 @@ Maat is a cross-chain intent protocol. A user signs one transaction on the sourc
 - Solana is the only destination.
 - TRON Nile and Robinhood Chain Testnet contracts are deployed, but their intents are not proven or settled yet (shown as "coming soon").
 - One intent per transaction.
-
----
+- A hardened contract revision (IntentManager v3 — fixes two fund-lock edge cases found in an independent audit, see [Security](#security)) is written, tested, and reviewed, but not yet deployed. The live contract is v2.
 
 ## Architecture (current)
 
 ```mermaid
 flowchart LR
-  U["User signs one tx<br/>ma-at.xyz/send"] --> C["IntentManager.sol<br/>Arbitrum Sepolia"]
+  U["User signs one tx<br/>ma-at.xyz/send"] --> C["IntentManager v2<br/>Arbitrum Sepolia"]
   C -- "IntentCreated event" --> L["Orchestrator listener"]
-  L --> P["Native pre-check"]
-  P --> Z["SP1 prover<br/>receipt-inclusion proof"]
+  L --> Z["SP1 prover<br/>receipt-inclusion proof"]
   Z --> G["Settle gate<br/>6 checks"]
-  G --> S["Anchor program<br/>Solana Devnet"]
-  S --> W["Destination wallet"]
+  G --> PC["Solver posts<br/>150% collateral"]
+  PC --> S["Solana payout"]
+  S --> CS["confirmSettlement<br/>collateral returned"]
   L -. "finality poller" .-> D["ma-at.xyz/proof"]
 ```
 
@@ -61,9 +61,10 @@ flowchart LR
 /contracts/solana  → Anchor settlement program
 /orchestrator      → Listeners, prover pipeline, settle gate, settlement
 /zk                → SP1 program (receipt inclusion) + host prover
+/docs/audits       → Independent security review reports
 ```
 
-The frontend (ma-at.xyz) lives in a separate repository: <!-- ADD LINK -->
+The frontend (ma-at.xyz) lives in a separate repository.
 
 ---
 
@@ -85,10 +86,11 @@ The frontend (ma-at.xyz) lives in a separate repository: <!-- ADD LINK -->
 | Function | Description |
 | --- | --- |
 | `submitIntent` | Escrows ETH or an ERC-20, creates the intent, emits `IntentCreated`, enforces circuit breaker |
-| `postCollateral` | Solver posts 150% collateral against the intent amount |
-| `confirmSettlement` | Orchestrator releases escrow to the solver after off-chain proof verification (no on-chain verification) |
+| `postCollateral` | An owner-approved solver posts 150% collateral against the intent amount |
+| `confirmSettlement` | Orchestrator releases escrow to the solver after off-chain proof verification (no on-chain verification), and returns the solver's collateral in full |
 | `slashSolver` | Orchestrator slashes a failed solver: escrow returns to the user, the solver's collateral goes to the treasury |
 | `cancelIntent` | Intent owner reclaims escrow once the intent has expired, if no solver posted collateral |
+| `claimRefund` | Escape hatch: if a solver posted collateral but the orchestrator never confirms or slashes, the intent owner can reclaim escrow 24 hours after expiry — even while the contract is paused |
 
 `IntentCreated(bytes32 indexed intentId, address indexed sender, uint256 amount, address tokenAddress, bytes32 destinationWallet, uint64 destinationChainId, uint64 expiry, uint16 slippageBps)`
 
@@ -98,7 +100,7 @@ The frontend (ma-at.xyz) lives in a separate repository: <!-- ADD LINK -->
 
 | Network | Address | Explorer |
 | --- | --- | --- |
-| Arbitrum Sepolia | `0x9D1bd7119E9FefF6Baa3968272811323B354B16f` | [Arbiscan](https://sepolia.arbiscan.io/address/0x9D1bd7119E9FefF6Baa3968272811323B354B16f) |
+| Arbitrum Sepolia (v2) | `0xa3d4B948593334E55F0caC52DE406381e7052eAa` | [Arbiscan](https://sepolia.arbiscan.io/address/0xa3d4B948593334E55F0caC52DE406381e7052eAa) |
 | Robinhood Chain Testnet | `0xcA6bf2D574209D49515a9Eeb61E27924edE28860` | [Explorer](https://explorer.testnet.chain.robinhood.com/address/0xcA6bf2D574209D49515a9Eeb61E27924edE28860) |
 | TRON Nile Testnet | `TW1PqkjksxFUefywyYYNHS4P2jeQaXzJWe` | [Tronscan](https://nile.tronscan.org/#/contract/TW1PqkjksxFUefywyYYNHS4P2jeQaXzJWe) |
 | Solana Devnet (program) | `9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv` | |
@@ -110,7 +112,7 @@ Current SP1 verification key: `0x000c653a242999b53decd2c3d31fc211e432b38eb4ead43
 ## Security
 
 - **Implemented:** the ZK receipt-inclusion proof, the six-check settle gate, the crash-safe settlement ledger, pausable contracts, and circuit breakers.
-- **Internal automated review:** contracts were checked with [glassofbeer.ai/heist](https://glassofbeer.ai/heist), our own adversarial exploit agent. This is an in-house tool, not a third-party audit. <!-- VERIFY: was it re-run on the current IntentManager (bytes32 / tokenAddress version)? State the date or commit. -->
+- **Internal automated review:** contracts were checked with [glassofbeer.ai/heist](https://glassofbeer.ai/heist), our own adversarial exploit agent. This is an in-house tool, not a third-party audit. Latest run: Sept 27, 2026, against commit `bb3e7c0` (IntentManager v2) — 8/8 tested invariants held (no double-payout, no unauthorized settlement/slash, no premature refund, reentrancy blocked). Two findings (both fund-lock edge cases under specific future conditions, neither exploitable on the current live deployment) are fixed in a reviewed v3, not yet deployed. [Full report](./docs/audits/2026-09-27-intentmanager-v2-heist-audit.md).
 - **Planned before mainnet:** an external third-party audit.
 
 ## The risk framework
@@ -124,6 +126,7 @@ Maat applies credit-risk principles to solver infrastructure. These are design g
 
 ## Roadmap
 
+- Deploy IntentManager v3 (independently audited fund-lock fixes), alongside the changes below.
 - Solver credit scoring and tiered routing.
 - On-chain proof verification on Solana (Groth16) and on-chain replay protection.
 - ZK proof of L1 finality.
@@ -137,6 +140,6 @@ Maat applies credit-risk principles to solver infrastructure. These are design g
 
 - Website: [ma-at.xyz](https://ma-at.xyz)
 - Proof dashboard: [ma-at.xyz/proof](https://ma-at.xyz/proof)
-- X: [@0xfourier](https://x.com/0xfourier)
+- X: [@maat_xyz](https://x.com/maat_xyz)
 
-*Maat | Solo founder build* 
+*Maat | Solo founder build*
