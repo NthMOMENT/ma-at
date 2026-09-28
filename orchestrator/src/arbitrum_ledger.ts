@@ -31,6 +31,14 @@ export interface ArbitrumLedgerEntry {
   /** json.expiry (unix seconds) — recorded once collateral is posted, so the
    *  slash poller doesn't need to re-derive it from the proof JSON later. */
   expiry?: number;
+  /** Which configured ARBITRUM_SOLVER_PRIVATE_KEY* address posted collateral
+   *  for this intent — written at the posting_collateral transition, BEFORE
+   *  broadcast (same tx-hash-before-broadcast timing as collateralTxHash
+   *  itself). Entries written before this field existed have none; callers
+   *  default to the orchestrator's first configured solver and rely on the
+   *  existing on-chain solver check (arbitrum_settlement.ts's Step 2) to
+   *  catch any real disagreement — see resumeCollateralPostedIntent. */
+  solver?: `0x${string}`;
   updatedAt: string;
 }
 

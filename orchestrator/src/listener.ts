@@ -41,7 +41,7 @@ import {
   isBlockFinal,
   setFinal,
 } from "./intent_state";
-import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, resumeCollateralPostedIntent, type SolanaPayoutResult } from "./arbitrum_settlement";
+import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, resumeCollateralPostedIntent, checkSolverApprovals, type SolanaPayoutResult } from "./arbitrum_settlement";
 import { redactError } from "./redact";
 import { createRotatingHttpTransport } from "./rpc_rotation";
 
@@ -679,6 +679,12 @@ async function main(): Promise<void> {
     logError("[FATAL] Cannot connect to Arbitrum Sepolia RPC:", err);
     process.exit(1);
   }
+
+  // Week 3 design §3.9 boot check: fresh on-chain read for every configured
+  // solver key. Not fatal for an unapproved one — Solver B can be configured
+  // before its setSolver approval lands — this just logs which keys are
+  // usable right now. No routing exists yet (Phase 3) to act on this.
+  await checkSolverApprovals(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS);
 
   // Gate 5D-fix (item 3): Robinhood is fully disabled for the MVP — no
   // connection attempt, no watcher — unless explicitly re-enabled. It was

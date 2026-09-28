@@ -7,7 +7,7 @@
 // orchestration itself (runArbitrumSettlementSequence) is deps-injected so
 // the state machine — every transition, every crash point, every tx revert —
 // is unit-testable without a live chain. See arbitrum_settlement.gate.test.ts.
-import { createWalletClient, encodeFunctionData, keccak256, type Hex } from "viem";
+import { createWalletClient, encodeFunctionData, keccak256, type Hex, type WalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arbitrumSepolia } from "viem/chains";
 import * as fs from "fs";
@@ -92,14 +92,146 @@ function requiredPrivateKeyEnv(name: string): Hex {
   return v as Hex;
 }
 
-const solverAccount = privateKeyToAccount(requiredPrivateKeyEnv("ARBITRUM_SOLVER_PRIVATE_KEY"));
+// ─── Multi-solver key loading (Week 3 design, §3.9 / Phase 1) ───────────────
+// ARBITRUM_SOLVER_PRIVATE_KEY_1, _2, ... _N (indexed, mirroring
+// ALCHEMY_RPC_URL_1/2/3's convention in rpc_rotation.ts) — read once, right
+// here, same discipline as every other key load in this file: only
+// `.address` (public, safe) ever leaves this block via the exported
+// SolverAccountConfig list. Legacy single ARBITRUM_SOLVER_PRIVATE_KEY is
+// treated as key 1 when no numbered vars are set, so a single-key .env is
+// unaffected by this change.
+
+export interface SolverPrivateKeyEnvEntry {
+  envVarName: string;
+  privateKey: Hex;
+}
+
+/// Pure — takes an env-like object so it's unit-testable without touching
+/// process.env or module load order. Numbered keys are collected from _1
+/// upward and stop at the first gap (matching "indexed" env-var reading
+/// elsewhere in this codebase); if none are set at all, falls back to the
+/// legacy single var as key 1.
+export function collectSolverPrivateKeyEnvEntries(env: NodeJS.ProcessEnv = process.env): SolverPrivateKeyEnvEntry[] {
+  const numbered: SolverPrivateKeyEnvEntry[] = [];
+  for (let i = 1; ; i++) {
+    const envVarName = `ARBITRUM_SOLVER_PRIVATE_KEY_${i}`;
+    const v = env[envVarName];
+    if (!v) break;
+    numbered.push({ envVarName, privateKey: v as Hex });
+  }
+  if (numbered.length > 0) return numbered;
+  const legacy = env.ARBITRUM_SOLVER_PRIVATE_KEY;
+  return legacy ? [{ envVarName: "ARBITRUM_SOLVER_PRIVATE_KEY", privateKey: legacy as Hex }] : [];
+}
+
+/// Pure — operator visibility for a mistake collectSolverPrivateKeyEnvEntries
+/// otherwise resolves silently: a numbered var set PAST the first gap (e.g.
+/// _1 set, _2 missing, _3 set) is never loaded (the collector stops at the
+/// gap), so without this it would look like _3 was simply never configured.
+/// Never fatal — only a warning naming exactly which var is ignored and why.
+export function findOrphanedSolverPrivateKeyEnvVars(env: NodeJS.ProcessEnv = process.env): string[] {
+  let contiguous = 0;
+  while (env[`ARBITRUM_SOLVER_PRIVATE_KEY_${contiguous + 1}`]) contiguous++;
+  const firstMissing = contiguous + 1;
+  const orphanIndices: number[] = [];
+  const pattern = /^ARBITRUM_SOLVER_PRIVATE_KEY_(\d+)$/;
+  for (const key of Object.keys(env)) {
+    const match = pattern.exec(key);
+    if (!match) continue;
+    const idx = Number(match[1]);
+    if (idx > contiguous && env[key]) orphanIndices.push(idx);
+  }
+  orphanIndices.sort((a, b) => a - b);
+  return orphanIndices.map((idx) => `ARBITRUM_SOLVER_PRIVATE_KEY_${idx} is set but _${firstMissing} is missing - ignoring it`);
+}
+
+/// Pure — operator visibility for the other silent case: when any numbered
+/// var is set, collectSolverPrivateKeyEnvEntries ignores the legacy var
+/// entirely (§3.9's documented priority) — worth a NOTE so an operator who
+/// set both doesn't wonder why the legacy key isn't in use.
+export function legacySolverKeyIgnoredNote(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (env.ARBITRUM_SOLVER_PRIVATE_KEY_1 && env.ARBITRUM_SOLVER_PRIVATE_KEY) {
+    return "ARBITRUM_SOLVER_PRIVATE_KEY (legacy) is also set but is ignored because ARBITRUM_SOLVER_PRIVATE_KEY_1 is present - remove one to avoid confusion";
+  }
+  return null;
+}
+
+export interface ResolvedSolverAccount {
+  envVarName: string;
+  address: `0x${string}`;
+}
+
+/// Pure — derives each entry's address (never returns the signing Account
+/// object itself) and throws if two entries resolve to the same address.
+/// Boot checks per §3.9: "addresses must be unique."
+export function resolveSolverAccounts(entries: SolverPrivateKeyEnvEntry[]): ResolvedSolverAccount[] {
+  const seenBy = new Map<string, string>(); // lowercased address -> envVarName that first claimed it
+  const out: ResolvedSolverAccount[] = [];
+  for (const entry of entries) {
+    const { address } = privateKeyToAccount(entry.privateKey);
+    const lower = address.toLowerCase();
+    const claimedBy = seenBy.get(lower);
+    if (claimedBy) {
+      throw new Error(`duplicate solver address ${address}: configured under both ${claimedBy} and ${entry.envVarName}`);
+    }
+    seenBy.set(lower, entry.envVarName);
+    out.push({ envVarName: entry.envVarName, address });
+  }
+  return out;
+}
+
 const orchestratorAccount = privateKeyToAccount(requiredPrivateKeyEnv("ARBITRUM_ORCHESTRATOR_PRIVATE_KEY"));
 
-console.log(`[ARB-SETTLE] solver address:       ${solverAccount.address}`);
+const transport = createRotatingHttpTransport(ALCHEMY_RPC_URLS, "Arbitrum-settle");
+
+interface SolverAccountConfig {
+  envVarName: string;
+  account: ReturnType<typeof privateKeyToAccount>;
+  walletClient: WalletClient;
+}
+
+// IIFE so the raw private-key strings (collectSolverPrivateKeyEnvEntries's
+// output) live only in this function's local scope, not in a persistent
+// module-level binding — same "read once, only the derived .address/account
+// survives" discipline as orchestratorAccount above, now that there's more
+// than one line of work between reading the env var and deriving the
+// account. Nothing outside this block ever sees the raw key strings.
+const { solverAccounts, defaultSolverAccount }: { solverAccounts: SolverAccountConfig[]; defaultSolverAccount: ReturnType<typeof privateKeyToAccount> } = (() => {
+  const entries = collectSolverPrivateKeyEnvEntries();
+  if (entries.length === 0) {
+    console.error("[FATAL] ARBITRUM_SOLVER_PRIVATE_KEY (or ARBITRUM_SOLVER_PRIVATE_KEY_1) must be set in .env");
+    process.exit(1);
+  }
+  try {
+    resolveSolverAccounts(entries);
+  } catch (err) {
+    console.error(`[FATAL] ${(err as Error).message}`);
+    process.exit(1);
+  }
+  for (const warning of findOrphanedSolverPrivateKeyEnvVars()) {
+    console.warn(`[ARB-SETTLE] WARNING: ${warning}`);
+  }
+  const legacyNote = legacySolverKeyIgnoredNote();
+  if (legacyNote) {
+    console.log(`[ARB-SETTLE] NOTE: ${legacyNote}`);
+  }
+  const accounts: SolverAccountConfig[] = entries.map((entry) => {
+    const account = privateKeyToAccount(entry.privateKey);
+    return { envVarName: entry.envVarName, account, walletClient: createWalletClient({ account, chain: arbitrumSepolia, transport }) };
+  });
+  // Preserves today's single-solver behavior byte-for-byte: every existing
+  // call site that doesn't pass an explicit solverAddress (i.e. everything —
+  // Phase 1 makes NO routing change) resolves to this one, exactly as before.
+  return { solverAccounts: accounts, defaultSolverAccount: accounts[0].account };
+})();
+
+console.log(`[ARB-SETTLE] loaded ${solverAccounts.length} solver key(s): ${solverAccounts.map((cfg) => cfg.account.address).join(", ")}`);
+console.log(`[ARB-SETTLE] solver address:       ${defaultSolverAccount.address}`);
+for (const cfg of solverAccounts.slice(1)) {
+  console.log(`[ARB-SETTLE] additional solver address (${cfg.envVarName}): ${cfg.account.address}`);
+}
 console.log(`[ARB-SETTLE] orchestrator address: ${orchestratorAccount.address}`);
 
-const transport = createRotatingHttpTransport(ALCHEMY_RPC_URLS, "Arbitrum-settle");
-const solverWalletClient = createWalletClient({ account: solverAccount, chain: arbitrumSepolia, transport });
 const orchestratorWalletClient = createWalletClient({ account: orchestratorAccount, chain: arbitrumSepolia, transport });
 
 // ─── ABI (v2 — just the functions/reads this sequence needs) ────────────────
@@ -152,6 +284,13 @@ export const INTENT_MANAGER_V2_READ_ABI = [
       { name: "createdAt", type: "uint256" },
       { name: "settledAt", type: "uint256" },
     ],
+  },
+  {
+    type: "function",
+    name: "approvedSolvers",
+    stateMutability: "view",
+    inputs: [{ name: "", type: "address" }],
+    outputs: [{ name: "", type: "bool" }],
   },
 ] as const;
 
@@ -250,9 +389,9 @@ export interface ArbitrumSettlementDeps {
 }
 
 async function signAndSend(
-  walletClient: typeof solverWalletClient,
+  walletClient: WalletClient,
   publicClient: PublicClient,
-  account: typeof solverAccount,
+  account: ReturnType<typeof privateKeyToAccount>,
   params: { functionName: "postCollateral" | "confirmSettlement" | "slashSolver"; args: readonly unknown[]; value?: bigint; address: `0x${string}` },
   onSigned: (hash: `0x${string}`) => void
 ): Promise<TxOutcome> {
@@ -306,17 +445,30 @@ export async function readIntentAfterPostCollateral(
   return onChain;
 }
 
+/// solverAddress defaults to the first configured ARBITRUM_SOLVER_PRIVATE_KEY*
+/// account — every existing call site omits it, so single-key behavior is
+/// byte-for-byte identical to before this function gained the parameter.
+/// Phase 1 makes NO routing change: callers that dispatch NEW settlements
+/// (triggerZKVerification) still never pass this explicitly either — that's
+/// Phase 3's job (selectSolver). This parameter exists today only so
+/// reconciliation/resume paths can rebuild deps scoped to whichever solver a
+/// ledger entry recorded (see resumeCollateralPostedIntent).
 export function buildRealDeps(
   publicClient: PublicClient,
   intentManagerAddress: `0x${string}`,
   runSolanaPayout: (zkProofHash: `0x${string}`) => Promise<SolanaPayoutResult>,
-  checkSolanaSignatureLanded: (sig: string) => Promise<boolean>
+  checkSolanaSignatureLanded: (sig: string) => Promise<boolean>,
+  solverAddress: `0x${string}` = defaultSolverAccount.address
 ): ArbitrumSettlementDeps {
+  const solverCfg = solverAccounts.find((cfg) => cfg.account.address.toLowerCase() === solverAddress.toLowerCase());
+  if (!solverCfg) {
+    throw new Error(`buildRealDeps: ${solverAddress} is not among the configured ARBITRUM_SOLVER_PRIVATE_KEY* accounts`);
+  }
   return {
-    solverAddress: solverAccount.address,
+    solverAddress: solverCfg.account.address,
     orchestratorAddress: orchestratorAccount.address,
     async getSolverBalanceWei() {
-      return publicClient.getBalance({ address: solverAccount.address });
+      return publicClient.getBalance({ address: solverCfg.account.address });
     },
     async readIntent(intentId) {
       const result = (await publicClient.readContract({
@@ -342,7 +494,7 @@ export function buildRealDeps(
       return { owner: result[0], amount: result[1], tokenAddress: result[2], status: result[7], solver: result[8], collateralPosted: result[9] };
     },
     async postCollateral(intentId, valueWei, onSigned) {
-      return signAndSend(solverWalletClient, publicClient, solverAccount, { functionName: "postCollateral", args: [intentId], value: valueWei, address: intentManagerAddress }, onSigned);
+      return signAndSend(solverCfg.walletClient, publicClient, solverCfg.account, { functionName: "postCollateral", args: [intentId], value: valueWei, address: intentManagerAddress }, onSigned);
     },
     async confirmSettlement(intentId, zkProofHash, onSigned) {
       return signAndSend(orchestratorWalletClient, publicClient, orchestratorAccount, { functionName: "confirmSettlement", args: [intentId, zkProofHash], address: intentManagerAddress }, onSigned);
@@ -354,6 +506,36 @@ export function buildRealDeps(
     checkSolanaSignatureLanded,
     nowSec: () => Math.floor(Date.now() / 1000),
   };
+}
+
+export interface SolverApprovalStatus {
+  envVarName: string;
+  address: `0x${string}`;
+  approved: boolean;
+}
+
+/// Boot check per §3.9: fresh on-chain read for every configured solver key,
+/// never cached. An unapproved key is NOT fatal — Solver B can be configured
+/// before its setSolver approval lands — it's just excluded from routing
+/// (Phase 3) until it is. Phase 1 has no routing yet, so this is
+/// informational (a warning) rather than gating anything itself.
+export async function checkSolverApprovals(publicClient: PublicClient, intentManagerAddress: `0x${string}`): Promise<SolverApprovalStatus[]> {
+  const out: SolverApprovalStatus[] = [];
+  for (const cfg of solverAccounts) {
+    const approved = (await publicClient.readContract({
+      address: intentManagerAddress,
+      abi: INTENT_MANAGER_V2_READ_ABI,
+      functionName: "approvedSolvers",
+      args: [cfg.account.address],
+    })) as boolean;
+    if (!approved) {
+      console.warn(`[ARB-SETTLE] WARNING: solver ${cfg.account.address} (${cfg.envVarName}) is not approved on-chain yet (see setSolver) — excluded from routing until approved`);
+    } else {
+      console.log(`[ARB-SETTLE] solver ${cfg.account.address} (${cfg.envVarName}) is approved on-chain`);
+    }
+    out.push({ envVarName: cfg.envVarName, address: cfg.account.address, approved });
+  }
+  return out;
 }
 
 // ─── Orchestration (the state machine under test) ───────────────────────────
@@ -402,7 +584,12 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
   // ── Step 1: postCollateral ──
   const collateralAmount = (BigInt(json.amount) * 150n) / 100n;
   const collateralOutcome = await deps.postCollateral(intentId, collateralAmount, (hash) => {
-    setArbitrumStage(intentId, "posting_collateral", { collateralTxHash: hash, expiry: json.expiry });
+    // §3.8: solver recorded BEFORE broadcast, same timing as collateralTxHash
+    // itself — this is the ledger's only source of truth for which
+    // configured solver this intent belongs to; every later stage's merge
+    // (setArbitrumStage spreads {...prev, ...patch}) carries it forward
+    // without needing to repeat it.
+    setArbitrumStage(intentId, "posting_collateral", { collateralTxHash: hash, expiry: json.expiry, solver: deps.solverAddress });
     mirrorDisplay(intentId, { stage: "posting_collateral", collateralTxHash: hash });
   });
   if (!collateralOutcome.ok) {
@@ -667,12 +854,22 @@ export async function resumeCollateralPostedIntent(
       console.log(`[ARB-SETTLE] intent ${id} is collateral_posted with the Solana payout already settled — resuming confirmSettlement.`);
       await confirmSettlementWithRetry(deps, id, json, zkProofHash);
     } else if (buildRunSolanaPayout) {
+      // §3.8 migration: an entry written before the ledger's solver field
+      // existed has none — default to deps.solverAddress (today's sole
+      // solver). Either way, Step 2 inside
+      // resumeArbitrumSettlementFromCollateralPosted below re-reads the
+      // intent's ACTUAL on-chain solver and treats any mismatch against
+      // this value as a genuine conflict (alerts, never pays Solana) — the
+      // exact same check it already runs for a same-solver setup, so a
+      // wrong/stale recorded solver can never cause a wrong payout, only a
+      // (safe) alert.
+      const resolvedSolverAddress = entry.solver ?? deps.solverAddress;
       // A real, per-intent runSolanaPayout — NOT the shared deps.runSolanaPayout
       // stub, which throws by design (see reconcileArbitrumLedger's own doc
       // comment below): this entry's Solana leg is a function of ITS OWN
       // intentId/json, which only the caller (listener.ts) can decode.
-      const resumeDeps: ArbitrumSettlementDeps = { ...deps, runSolanaPayout: buildRunSolanaPayout(id, json) };
-      console.log(`[ARB-SETTLE] intent ${id} is collateral_posted but never got past the on-chain check — resuming from Step 2.`);
+      const resumeDeps: ArbitrumSettlementDeps = { ...deps, solverAddress: resolvedSolverAddress, runSolanaPayout: buildRunSolanaPayout(id, json) };
+      console.log(`[ARB-SETTLE] intent ${id} is collateral_posted but never got past the on-chain check — resuming from Step 2 (recorded solver: ${resolvedSolverAddress}).`);
       await resumeArbitrumSettlementFromCollateralPosted(resumeDeps, id, json);
     } else {
       const reason = `collateral posted (tx ${entry.collateralTxHash}) but the Solana leg was never started, and this reconciliation pass has no way to run it (no buildRunSolanaPayout provided) — needs manual review`;
