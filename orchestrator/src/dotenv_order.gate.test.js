@@ -114,11 +114,23 @@ async function main() {
 
   // Gate 5D-fix item 2: the fake ALCHEMY_RPC_URL_1 above is unauthenticated,
   // so connecting to it for real (arbClient.getBlockNumber() in main()) is
-  // expected to fail — and that failure's message embeds the URL, API key
-  // and all, exactly like a real Alchemy 401 would. Proves logError()'s
-  // redactError() wrapping is actually wired into the real boot path, not
-  // just unit-tested in isolation (see redact_gate.test.ts's own
-  // redactError coverage for the isolated version).
+  // expected to fail. Historically (before rpc_rotation.ts, commit b02588c)
+  // that failure came from viem's own http() transport, whose error message
+  // embeds the URL — API key and all — so redactError()'s [redacted-url]
+  // placeholder was the visible proof that logError()'s wrapping was really
+  // wired into the boot path. Since b02588c, createRotatingHttpTransport does
+  // its own fetch() (rpc_rotation.ts's rpcPost) and deliberately throws a
+  // generic `HTTP ${status} from RPC endpoint` with NO url in it at all —
+  // stronger than redacting after the fact (there is nothing left to catch),
+  // but it means the placeholder never appears for THIS failure anymore.
+  // Verified by bisecting: the placeholder check passes at b02588c's parent
+  // and fails at b02588c itself, with the identical installed viem version
+  // both times — a real behavior change in rpc_rotation.ts, not viem drift.
+  // The property that actually matters — no raw URL/key ever reaches
+  // output — still must hold either way, so this checks for EITHER outcome:
+  // the placeholder (the older transport path, still reachable if something
+  // ever calls plain http()/fallback() directly again), or no URL of any
+  // kind at all (today's rotating-transport path).
   check(
     'the RPC connection failure this fake URL causes actually happened (proves the next two checks exercised something real)',
     stderr.includes('[FATAL] Cannot connect to Arbitrum Sepolia RPC')
@@ -128,8 +140,8 @@ async function main() {
     !stdout.includes('faketestkey123456789') && !stderr.includes('faketestkey123456789')
   );
   check(
-    'the redaction placeholder appears in its place',
-    stderr.includes('[redacted-url]')
+    'the redaction placeholder appears in its place, OR (today\'s rotating transport) no URL of any kind leaked — either way nothing raw got through',
+    stderr.includes('[redacted-url]') || (!/https?:\/\//.test(stdout) && !/https?:\/\//.test(stderr))
   );
 
   if (failures > 0) {
