@@ -1,0 +1,7 @@
+[
+  {
+    "intentId": "0x0ebb033bec8db89338197f47b8ce08b4f2e6bff1be96002d9d54b96884db84de",
+    "solver": "0xE39677A621d3f232E9b6A97e84aCD03443540a61",
+    "reason": "orchestrator bug: Solana payout had finalized; fixed by the slash-guard change (commit 7cae244)"
+  }
+]
