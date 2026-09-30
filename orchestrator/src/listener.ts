@@ -41,7 +41,8 @@ import {
   isBlockFinal,
   setFinal,
 } from "./intent_state";
-import { buildRealDeps, runArbitrumSettlementSequence, pollAwaitingSlash, reconcileArbitrumLedger, resumeCollateralPostedIntent, checkSolverApprovals, type SolanaPayoutResult } from "./arbitrum_settlement";
+import { buildRealDeps, pollAwaitingSlash, reconcileArbitrumLedger, resumeCollateralPostedIntent, checkSolverApprovals, type SolanaPayoutResult } from "./arbitrum_settlement";
+import { dispatchArbitrumSettlement, buildRealRoutingDeps } from "./solver_routing";
 import { redactError } from "./redact";
 import { createRotatingHttpTransport } from "./rpc_rotation";
 
@@ -341,13 +342,22 @@ function triggerZKVerification(
     const payoutDestination = decodeDestinationWallet(json.destination_wallet as `0x${string}`, BigInt(json.destination_chain_id));
 
     console.log(`[SETTLE] all gate checks passed — running Arbitrum settlement sequence (postCollateral -> Solana payout -> confirmSettlement/slashSolver)...`);
-    const deps = buildRealDeps(
-      arbClient,
-      ARBITRUM_INTENT_MANAGER_ADDRESS,
-      (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash),
-      checkSolanaSignatureLanded
+    // Week 3 Phase 3: pick the solver first (solver_routing.ts), then run the
+    // unchanged sequence with THAT solver's deps. Same buildRealDeps call as
+    // before, now bound to the selected solver instead of always key 1.
+    await dispatchArbitrumSettlement(
+      buildRealRoutingDeps(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS, (solverAddress) =>
+        buildRealDeps(
+          arbClient,
+          ARBITRUM_INTENT_MANAGER_ADDRESS,
+          (zkProofHash) => runSolanaPayout(intentId, json, payoutDestination, zkProofHash),
+          checkSolanaSignatureLanded,
+          solverAddress
+        )
+      ),
+      json.intent_id as `0x${string}`,
+      json
     );
-    await runArbitrumSettlementSequence(deps, json.intent_id as `0x${string}`, json);
   });
 }
 
@@ -683,7 +693,8 @@ async function main(): Promise<void> {
   // Week 3 design §3.9 boot check: fresh on-chain read for every configured
   // solver key. Not fatal for an unapproved one — Solver B can be configured
   // before its setSolver approval lands — this just logs which keys are
-  // usable right now. No routing exists yet (Phase 3) to act on this.
+  // usable right now. Routing (solver_routing.ts) never relies on this boot
+  // snapshot: it re-reads approvedSolvers fresh for every intent.
   await checkSolverApprovals(arbClient, ARBITRUM_INTENT_MANAGER_ADDRESS);
 
   // Gate 5D-fix (item 3): Robinhood is fully disabled for the MVP — no

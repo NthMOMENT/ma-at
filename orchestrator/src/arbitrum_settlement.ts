@@ -17,20 +17,30 @@ import type { PublicClient } from "viem";
 import type { ProofOutputJson } from "./prover_pipeline";
 import { ZK_DIR, alert } from "./prover_pipeline";
 import { recordAlertReason, setArbitrumSettlement, setSettled, type ArbitrumSettlementStage } from "./intent_state";
-import { setArbitrumStage, getArbitrumLedgerEntry, getMidSequenceEntries, getAwaitingExpirySlashEntries, getCollateralPostedEntries } from "./arbitrum_ledger";
+import {
+  setArbitrumStage,
+  getArbitrumLedgerEntry,
+  getMidSequenceEntries,
+  getAwaitingExpirySlashEntries,
+  getCollateralPostedEntries,
+  type ArbitrumLedgerEntry,
+  type RoutingDecisionFields,
+} from "./arbitrum_ledger";
 import { isAlreadySettled, readProofJson, getLedgerEntry, markSettled } from "./prover_pipeline";
 import { redact } from "./redact";
 import { createRotatingHttpTransport } from "./rpc_rotation";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const MAX_TRANSFER_WEI = BigInt(process.env.MAX_TRANSFER_WEI ?? "10000000000000000"); // 0.01 ETH
-const DELIVERY_MARGIN_SEC = Number(process.env.DELIVERY_MARGIN_SEC ?? 600);
+// Exported (Phase 3) so solver_routing.ts's hard gates run evaluateArbitrumGate
+// with these exact values — one source of truth, never a second copy.
+export const MAX_TRANSFER_WEI = BigInt(process.env.MAX_TRANSFER_WEI ?? "10000000000000000"); // 0.01 ETH
+export const DELIVERY_MARGIN_SEC = Number(process.env.DELIVERY_MARGIN_SEC ?? 600);
 // Headroom above the exact 150% collateral requirement so postCollateral's
 // own gas cost never turns "solver can afford collateral" into "solver ran
 // out of ETH mid-tx" — no spec default given, 0.001 ETH is generous for a
 // single L2 write at Arbitrum Sepolia's gas prices.
-const ARBITRUM_GAS_BUFFER_WEI = BigInt(process.env.ARBITRUM_GAS_BUFFER_WEI ?? "1000000000000000");
+export const ARBITRUM_GAS_BUFFER_WEI = BigInt(process.env.ARBITRUM_GAS_BUFFER_WEI ?? "1000000000000000");
 const SOLANA_PAYOUT_RETRY_INTERVAL_MS = Number(process.env.SOLANA_PAYOUT_RETRY_INTERVAL_MS ?? 30_000);
 // Gate 5D-race-fix: the Step 2 on-chain check runs right after postCollateral's
 // OWN tx receipt was already confirmed — but that receipt and this read can
@@ -232,6 +242,13 @@ for (const cfg of solverAccounts.slice(1)) {
 }
 console.log(`[ARB-SETTLE] orchestrator address: ${orchestratorAccount.address}`);
 
+/// Every configured ARBITRUM_SOLVER_PRIVATE_KEY* address, in key order —
+/// the full, unfiltered routing candidate list (solver_routing.ts). Addresses
+/// only, never the accounts/keys themselves.
+export function configuredSolverAddresses(): `0x${string}`[] {
+  return solverAccounts.map((cfg) => cfg.account.address);
+}
+
 const orchestratorWalletClient = createWalletClient({ account: orchestratorAccount, chain: arbitrumSepolia, transport });
 
 // ─── ABI (v2 — just the functions/reads this sequence needs) ────────────────
@@ -386,6 +403,12 @@ export interface ArbitrumSettlementDeps {
    *  reconcileSettlingLedger — see listener.ts's real implementation. */
   checkSolanaSignatureLanded(sig: string): Promise<boolean>;
   nowSec(): number;
+  /** Phase 3: set only by solver_routing.ts's dispatchArbitrumSettlement.
+   *  Spread into every pre-collateral ledger write below, so the routing
+   *  decision lands in the same pre-broadcast patch as `solver`. Absent for
+   *  every other caller (reconciliation, the slash poller, existing tests),
+   *  which therefore write byte-identical ledger entries to before. */
+  routing?: RoutingDecisionFields;
 }
 
 async function signAndSend(
@@ -519,15 +542,21 @@ export interface SolverApprovalStatus {
 /// before its setSolver approval lands — it's just excluded from routing
 /// (Phase 3) until it is. Phase 1 has no routing yet, so this is
 /// informational (a warning) rather than gating anything itself.
+/// Fresh approvedSolvers(address) read — never cached. Shared by the boot
+/// check below and solver_routing.ts's per-intent approval gate.
+export async function isSolverApprovedOnChain(publicClient: PublicClient, intentManagerAddress: `0x${string}`, solverAddress: `0x${string}`): Promise<boolean> {
+  return (await publicClient.readContract({
+    address: intentManagerAddress,
+    abi: INTENT_MANAGER_V2_READ_ABI,
+    functionName: "approvedSolvers",
+    args: [solverAddress],
+  })) as boolean;
+}
+
 export async function checkSolverApprovals(publicClient: PublicClient, intentManagerAddress: `0x${string}`): Promise<SolverApprovalStatus[]> {
   const out: SolverApprovalStatus[] = [];
   for (const cfg of solverAccounts) {
-    const approved = (await publicClient.readContract({
-      address: intentManagerAddress,
-      abi: INTENT_MANAGER_V2_READ_ABI,
-      functionName: "approvedSolvers",
-      args: [cfg.account.address],
-    })) as boolean;
+    const approved = await isSolverApprovedOnChain(publicClient, intentManagerAddress, cfg.account.address);
     if (!approved) {
       console.warn(`[ARB-SETTLE] WARNING: solver ${cfg.account.address} (${cfg.envVarName}) is not approved on-chain yet (see setSolver) — excluded from routing until approved`);
     } else {
@@ -545,6 +574,19 @@ function mirrorDisplay(
   patch: { stage: ArbitrumSettlementStage; collateralTxHash?: string; confirmTxHash?: string; slashTxHash?: string; reason?: string }
 ): void {
   setArbitrumSettlement(intentId, patch);
+}
+
+/// The "no collateral posted" refusal path: alert, record the reason, mark the
+/// ledger collateral_failed, mirror it for display. The user's only recourse
+/// is cancelIntent after expiry, exactly like an intent no solver ever
+/// touched. Shared by runArbitrumSettlementSequence's own gate refusal and
+/// solver_routing.ts's "no eligible solver" outcome, so both fail the same way.
+export function refuseArbitrumSettlement(intentId: `0x${string}`, json: ProofOutputJson, reason: string, ledgerPatch: Partial<ArbitrumLedgerEntry> = {}): void {
+  const intentIdHex = intentId.replace(/^0x/i, "").toLowerCase();
+  alert(`intent 0x${intentIdHex}: ${reason}`);
+  recordAlertReason(intentId, reason);
+  setArbitrumStage(intentId, "collateral_failed", { ...ledgerPatch, expiry: json.expiry });
+  mirrorDisplay(intentId, { stage: "collateral_failed", reason });
 }
 
 /// Runs the full Arbitrum settlement sequence for one intent, after the
@@ -574,10 +616,7 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
   });
   if (!gate.ok) {
     const reason = `Arbitrum settle gate REFUSED (failed: ${gate.failedChecks.join(", ")}) — no collateral posted; user can reclaim via cancelIntent once the intent expires`;
-    alert(`intent 0x${intentIdHex}: ${reason}`);
-    recordAlertReason(intentId, reason);
-    setArbitrumStage(intentId, "collateral_failed", { expiry: json.expiry });
-    mirrorDisplay(intentId, { stage: "collateral_failed", reason });
+    refuseArbitrumSettlement(intentId, json, reason, deps.routing);
     return;
   }
 
@@ -589,14 +628,14 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
     // configured solver this intent belongs to; every later stage's merge
     // (setArbitrumStage spreads {...prev, ...patch}) carries it forward
     // without needing to repeat it.
-    setArbitrumStage(intentId, "posting_collateral", { collateralTxHash: hash, expiry: json.expiry, solver: deps.solverAddress });
+    setArbitrumStage(intentId, "posting_collateral", { collateralTxHash: hash, expiry: json.expiry, solver: deps.solverAddress, ...deps.routing });
     mirrorDisplay(intentId, { stage: "posting_collateral", collateralTxHash: hash });
   });
   if (!collateralOutcome.ok) {
     const reason = `postCollateral failed: ${collateralOutcome.error ?? "unknown"}`;
     alert(`intent 0x${intentIdHex}: ${reason}`);
     recordAlertReason(intentId, reason);
-    setArbitrumStage(intentId, "collateral_failed", { collateralTxHash: collateralOutcome.txHash, expiry: json.expiry });
+    setArbitrumStage(intentId, "collateral_failed", { ...deps.routing, collateralTxHash: collateralOutcome.txHash, expiry: json.expiry });
     mirrorDisplay(intentId, { stage: "collateral_failed", collateralTxHash: collateralOutcome.txHash, reason });
     return;
   }

@@ -8,14 +8,12 @@
 // that file's test 23).
 //
 // Same "no test runner wired up yet" pattern as the other *.gate.test.ts
-// files. process.env is read by arbitrum_settlement.ts at IMPORT time (a
-// module-level `require`), and a static `import` is hoisted above any other
-// top-level code in this file regardless of source order (the same class of
-// ordering hazard the codebase's own dotenv-order fix addresses) — so these
-// vars cannot be set from inside this file; they must come from the caller,
-// exactly like arbitrum_settlement.gate.test.ts's own required vars. Every
-// path below is still generated fresh per run via mktemp/mktemp -d — never a
-// fixed /tmp path. Run with:
+// files. arbitrum_settlement.ts reads process.env once, at import time, so
+// these vars are required from the caller and checked before the imports
+// below (this project compiles to CommonJS, which keeps each `require` where
+// its `import` is written — see listener.ts's header). Every path is
+// generated fresh per run via mktemp/mktemp -d — never a fixed /tmp path.
+// Run with:
 //
 //   MAAT_STATE_DIR=$(mktemp -d) \
 //   SETTLED_LEDGER_PATH=$(mktemp -u) \

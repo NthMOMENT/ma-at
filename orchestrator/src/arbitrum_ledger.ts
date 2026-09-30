@@ -23,7 +23,22 @@ export type ArbitrumStage =
   | "slashing"
   | "slashed";
 
-export interface ArbitrumLedgerEntry {
+/** Week 3 Phase 3 routing decision (solver_routing.ts's selectSolver), for
+ *  Phase 4's dashboard. Written in the SAME pre-broadcast patch as `solver`
+ *  (see runArbitrumSettlementSequence's postCollateral onSigned), or on the
+ *  collateral_failed entry when routing found no eligible solver. Entries
+ *  written before Phase 3 have none of these. */
+export interface RoutingDecisionFields {
+  selectedSolver: `0x${string}` | null;
+  tierAtSelection: number | null;
+  routingReason: string;
+  /** postCollateral's value (wei, decimal string). Lets a restarted process
+   *  still count an in-flight posting_collateral entry against its solver's
+   *  available capital (solver_routing.ts's ledger reservation term). */
+  collateralWei?: string;
+}
+
+export interface ArbitrumLedgerEntry extends Partial<RoutingDecisionFields> {
   stage: ArbitrumStage;
   collateralTxHash?: string;
   confirmTxHash?: string;
@@ -90,6 +105,18 @@ export function getMidSequenceEntries(): Array<{ intentId: string; entry: Arbitr
     if (entry.stage === "posting_collateral" || entry.stage === "confirming" || entry.stage === "slashing") {
       out.push({ intentId, entry });
     }
+  }
+  return out;
+}
+
+/** postCollateral signed (hash recorded) but its receipt not yet seen —
+ *  collateral that may already be leaving that solver's wallet. Read by
+ *  solver_routing.ts so a restarted process (empty in-memory reservations)
+ *  still counts it against the solver's available capital. */
+export function getPostingCollateralEntries(): Array<{ intentId: string; entry: ArbitrumLedgerEntry }> {
+  const out: Array<{ intentId: string; entry: ArbitrumLedgerEntry }> = [];
+  for (const [intentId, entry] of ledger.entries()) {
+    if (entry.stage === "posting_collateral") out.push({ intentId, entry });
   }
   return out;
 }
