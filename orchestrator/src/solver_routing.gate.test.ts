@@ -337,6 +337,7 @@ async function main(): Promise<void> {
     check("display mirror identical", today.display === routed.display);
     check("final chain state identical", today.chain === routed.chain);
     check("routed entry records the decision (selected A, T2)", routed.entry?.selectedSolver === SOLVER_A && routed.entry?.tierAtSelection === 2);
+    check("solverRouting display mirror: written on the routed side only", readState(today.id)?.solverRouting === undefined && readState(routed.id)?.solverRouting?.solver === SOLVER_A);
   }
 
   console.log("[gate-test] 1b) single solver, identical to today: postCollateral reverts -> collateral_failed");
@@ -504,6 +505,8 @@ async function main(): Promise<void> {
     const entry = getArbitrumLedgerEntry(id);
     check("ledger collateral_failed with selectedSolver null + the full reason", entry?.stage === "collateral_failed" && entry.selectedSolver === null && entry.routingReason === selection?.reason);
     check("alert says routing REFUSED and points at cancelIntent", !!readState(id)?.alertReason?.includes("routing REFUSED") && !!readState(id)?.alertReason?.includes("cancelIntent"));
+    const shown = readState(id)?.solverRouting;
+    check("display mirror: solverRouting solver/tier null, reason names both candidates", shown?.solver === null && shown?.tier === null && !!shown?.reason.startsWith("no eligible solver") && shown.reason.includes(SOLVER_A) && shown.reason.includes(SOLVER_B));
     check("no reservation left behind", w.book.reservedWei(SOLVER_A) === 0n && w.book.reservedWei(SOLVER_B) === 0n);
   }
 
@@ -595,6 +598,8 @@ async function main(): Promise<void> {
     check("reservation already in place when postCollateral ran", reservedAtPost === RESERVE_SMALL);
     check("at signing (before broadcast) the ledger entry is posting_collateral with solver + all routing fields", entryAtSigning?.stage === "posting_collateral" && entryAtSigning.solver === SOLVER_A && entryAtSigning.selectedSolver === SOLVER_A && entryAtSigning.tierAtSelection === 2 && entryAtSigning.routingReason === `selected ${SOLVER_A} (T2): only eligible solver` && entryAtSigning.collateralWei === ((SMALL * 150n) / 100n).toString());
     check("sequence completed (confirmed)", getArbitrumLedgerEntry(id)?.stage === "confirmed");
+    const shown = readState(id)?.solverRouting;
+    check("display mirror matches the ledger (solver, tier, reason)", shown?.solver === SOLVER_A && shown?.tier === 2 && shown?.reason === getArbitrumLedgerEntry(id)?.routingReason);
     check("still reserved right after (hold window)", w.book.reservedWei(SOLVER_A) === RESERVE_SMALL);
     w.clock.ms += 29_999;
     check("still reserved at 29.999s", w.book.reservedWei(SOLVER_A) === RESERVE_SMALL);
@@ -611,6 +616,7 @@ async function main(): Promise<void> {
     const w = routingWorld(chain, [SOLVER_A], { revertPost: true });
     await dispatchArbitrumSettlement(w.deps, id, baseJson(id));
     check("ledger collateral_failed (today's path), routing fields kept", getArbitrumLedgerEntry(id)?.stage === "collateral_failed" && getArbitrumLedgerEntry(id)?.selectedSolver === SOLVER_A);
+    check("display mirror still shows the routing decision", readState(id)?.solverRouting?.solver === SOLVER_A);
     check("reservation released with no hold", w.book.reservedWei(SOLVER_A) === 0n);
   }
 
@@ -625,6 +631,7 @@ async function main(): Promise<void> {
     await dispatchArbitrumSettlement(w.deps, id, json);
     check("no postCollateral", !w.log.some((l) => l.startsWith("postCollateral")));
     check("collateral_failed via today's settle-gate text, still carrying the routing decision", getArbitrumLedgerEntry(id)?.stage === "collateral_failed" && !!readState(id)?.alertReason?.includes("settle gate REFUSED") && getArbitrumLedgerEntry(id)?.selectedSolver === SOLVER_A);
+    check("display mirror shows the selection that the final gate then refused", readState(id)?.solverRouting?.solver === SOLVER_A && readState(id)?.arbitrumSettlement.stage === "collateral_failed");
     check("reservation released", w.book.reservedWei(SOLVER_A) === 0n);
   }
 

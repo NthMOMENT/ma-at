@@ -33,6 +33,8 @@ import {
   listPendingFinality,
   isBlockFinal,
   setFinal,
+  setArbitrumSettlement,
+  setSolverRouting,
 } from "./intent_state";
 
 let failures = 0;
@@ -184,6 +186,51 @@ console.log("[gate-test] 6) atomic write: no .tmp files left behind, on-disk JSO
 
   const onDisk = JSON.parse(fs.readFileSync(`${STATE_DIR}/${id.replace(/^0x/, "")}.json`, "utf8"));
   check("on-disk file matches readState()", JSON.stringify(onDisk) === JSON.stringify(readState(id)));
+}
+
+console.log("[gate-test] 7) solverRouting (Phase 4): selected, no-eligible-solver, redaction, and an old-format file without the field");
+{
+  const SOLVER = "0xb1cc4DB8EC2430E60aaf1b1B8e564b8364383637";
+  const id = "0x" + "08".repeat(32);
+  recordIntentCreated(baseFields(id), { kind: "queued" });
+  check("fresh intent has no solverRouting", readState(id)!.solverRouting === undefined);
+
+  setSolverRouting(id, { solver: SOLVER, tier: 1, reason: `selected ${SOLVER} (T1): only eligible solver` });
+  let s = readState(id)!;
+  check("solver recorded", s.solverRouting?.solver === SOLVER);
+  check("tier recorded", s.solverRouting?.tier === 1);
+  check("reason recorded verbatim (0x address survives redaction)", s.solverRouting?.reason === `selected ${SOLVER} (T1): only eligible solver`);
+  check("sourceChain untouched", s.sourceChain === "Arbitrum Sepolia");
+
+  setArbitrumSettlement(id, { stage: "confirmed" });
+  check("later setters leave solverRouting intact", readState(id)!.solverRouting?.solver === SOLVER);
+
+  const id2 = "0x" + "09".repeat(32);
+  recordIntentCreated(baseFields(id2), { kind: "queued" });
+  setSolverRouting(id2, { solver: null, tier: null, reason: `no eligible solver — ${SOLVER}: not_approved` });
+  s = readState(id2)!;
+  check("no-eligible: solver null", s.solverRouting?.solver === null);
+  check("no-eligible: tier null", s.solverRouting?.tier === null);
+  check("no-eligible: reason kept", s.solverRouting?.reason === `no eligible solver — ${SOLVER}: not_approved`);
+
+  setSolverRouting(id2, { solver: SOLVER, tier: 2, reason: "rpc https://arb-sepolia.g.alchemy.com/v2/FAKEKEY123 down" });
+  s = readState(id2)!;
+  check("re-route replaces the whole block", s.solverRouting?.solver === SOLVER && s.solverRouting?.tier === 2);
+  check("reason redacted before storage", !!s.solverRouting?.reason.includes("[redacted-url]") && !s.solverRouting?.reason.includes("FAKEKEY123"));
+
+  // A state file exactly as written before Phase 4: no solverRouting key.
+  const id3 = "0x" + "0a".repeat(32);
+  recordIntentCreated(baseFields(id3), { kind: "queued" });
+  const file3 = `${STATE_DIR}/${id3.replace(/^0x/, "")}.json`;
+  const legacy = JSON.parse(fs.readFileSync(file3, "utf8"));
+  delete legacy.solverRouting;
+  fs.writeFileSync(file3, JSON.stringify(legacy, null, 2));
+  const loaded = readState(id3);
+  check("old-format file loads", loaded !== null && loaded.intentId === id3);
+  check("old-format file has no solverRouting", loaded?.solverRouting === undefined);
+  setFinal(id3);
+  const reserialized = JSON.parse(fs.readFileSync(file3, "utf8"));
+  check("old-format file re-serializes without inventing solverRouting", !("solverRouting" in reserialized) && reserialized.finality === "final");
 }
 
 if (failures > 0) {

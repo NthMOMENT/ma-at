@@ -61,6 +61,20 @@ export interface ArbitrumSettlementStatus {
   reason?: string;
 }
 
+// Week 3 Phase 4: display mirror of solver_routing.ts's selectSolver decision
+// (SelectionResult's solver/tier/reason — same names). The arbitrum ledger's
+// selectedSolver/tierAtSelection/routingReason remain the record of truth;
+// this is written from the same call sites (see arbitrum_settlement.ts's
+// mirrorRouting) so the two never disagree.
+export interface SolverRoutingStatus {
+  /** The selected solver's address, or null when no candidate was eligible. */
+  solver: string | null;
+  /** tierAtSelection; null when no candidate was eligible. */
+  tier: number | null;
+  /** routingReason — redacted before storage, see setSolverRouting. */
+  reason: string;
+}
+
 export type FinalityStatus = "pending" | "final";
 
 export interface IntentStateTimestamps {
@@ -97,6 +111,9 @@ export interface IntentState {
   alertReason: string | null;
   settlement: SettlementStatus;
   arbitrumSettlement: ArbitrumSettlementStatus;
+  /** Absent on intents never routed — anything written before Phase 4, and
+   *  any intent that never reached dispatchArbitrumSettlement. */
+  solverRouting?: SolverRoutingStatus;
   finality: FinalityStatus;
   timestamps: IntentStateTimestamps;
   updatedAt: string;
@@ -275,6 +292,16 @@ export function setArbitrumSettlement(intentId: string, patch: Partial<ArbitrumS
       ...patch,
       reason: patch.reason !== undefined ? redact(patch.reason) : prev.arbitrumSettlement.reason,
     },
+  }));
+}
+
+// Phase 4: replaces the whole block rather than merging — a re-route after
+// collateral_failed is a fresh decision, exactly as the ledger overwrites
+// all three routing fields on that path.
+export function setSolverRouting(intentId: string, routing: SolverRoutingStatus): void {
+  upsert(intentId, (prev) => ({
+    ...prev,
+    solverRouting: { solver: routing.solver, tier: routing.tier, reason: redact(routing.reason) },
   }));
 }
 

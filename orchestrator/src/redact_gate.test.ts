@@ -124,6 +124,35 @@ console.log("[gate-test] 8) redactError(): handles a non-Error thrown value too 
   check("string-thrown value also redacted", !out.includes(FAKE_URL_WITH_KEY) && out.includes("[redacted-url]"));
 }
 
+console.log("[gate-test] 9) redact() does NOT redact lowercase snake_case reason codes (Phase 4 false positive)");
+{
+  for (const code of ["insufficient_available_capital", "track_record_unavailable", "amount_exceeds_max_transfer"]) {
+    check(`${code} survives alone`, redact(code) === code);
+  }
+  const reason =
+    "no eligible solver — 0xb1cc4DB8EC2430E60aaf1b1B8e564b8364383637: insufficient_available_capital(available=100,required=200), track_record_unavailable, amount_exceeds_max_transfer";
+  check("all three survive inside a real routing reason", redact(reason) === reason);
+}
+
+console.log("[gate-test] 10) the snake_case exemption does NOT let secret shapes through");
+{
+  const mustRedact: Array<[string, string]> = [
+    ["mixed-case alphanumeric (Alchemy-style key)", "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY"],
+    ["lowercase hex, no 0x (raw private key shape)", "11".repeat(32)],
+    ["lowercase alphanumeric, no underscore", "k3j2h4g5f6d7s8a9q1w2e3r4t5y6"],
+    ["prefixed key with digits (provider-key style)", "test_fixture_0000aaaa1111bbbb222"],
+    ["prefixed key, mixed case", "test_fixture_0000AaAa1111BbBb222"],
+    ["snake_case prefix with a secret glued on by a hyphen", "some_reason_code-aB3dE5fG7hJ9kL1mN3pQ"],
+    ["snake_case prefix with a digit segment", "reason_code_a8f3k2x9q1w2e3r4t5"],
+    ["base64url token with - and _", "dGhpc19pc19h-c2VjcmV0X3Rva2Vu_Zm9vYmFy"],
+    ["leading-underscore token", "_abcdefghijklmnopqrstuvwxyz_abc"],
+  ];
+  for (const [label, secret] of mustRedact) {
+    const out = redact(`auth failed: ${secret} rejected`);
+    check(`${label} redacted`, !out.includes(secret) && out.includes("[redacted]"));
+  }
+}
+
 if (failures > 0) {
   console.error(`\n[gate-test] ${failures} check(s) FAILED`);
   process.exit(1);

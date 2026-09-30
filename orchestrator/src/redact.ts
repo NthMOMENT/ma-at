@@ -25,7 +25,16 @@ export function redact(text: string): string {
     // survive redaction must format it with an "0x" prefix (this codebase's
     // own convention — see prover_pipeline.ts's alert() call sites) rather
     // than relying on this function to guess.
-    .replace(/\b(?!0x)(?![A-Z][A-Z0-9_]*\b)[A-Za-z0-9_-]{24,}\b/g, "[redacted]");
+    //
+    // Third exemption: a lowercase snake_case reason code (e.g.
+    // insufficient_available_capital, from solver_routing.ts's exclusion
+    // reasons) — letters only, at least one underscore. Anchored to the END
+    // of the whole token (not \b, which stops at a hyphen) so a secret
+    // glued on after a snake_case prefix ("some_code-Xy9...") still gets
+    // redacted as one token. Digits deliberately excluded: every real reason
+    // code is letters-only, and it keeps prefixed keys like test_fixture_0000...
+    // out of this exemption.
+    .replace(/\b(?!0x)(?![A-Z][A-Z0-9_]*\b)(?![a-z]+(?:_[a-z]+)+(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{24,}\b/g, "[redacted]");
 }
 
 // Gate 5D-fix: the console-output half of the same guarantee — every

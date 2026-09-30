@@ -16,7 +16,7 @@ import { createHash } from "crypto";
 import type { PublicClient } from "viem";
 import type { ProofOutputJson } from "./prover_pipeline";
 import { ZK_DIR, alert } from "./prover_pipeline";
-import { recordAlertReason, setArbitrumSettlement, setSettled, type ArbitrumSettlementStage } from "./intent_state";
+import { recordAlertReason, setArbitrumSettlement, setSettled, setSolverRouting, type ArbitrumSettlementStage } from "./intent_state";
 import {
   setArbitrumStage,
   getArbitrumLedgerEntry,
@@ -576,6 +576,15 @@ function mirrorDisplay(
   setArbitrumSettlement(intentId, patch);
 }
 
+/// Phase 4: display mirror of the routing decision, called right after every
+/// ledger write that carries it, so the dashboard and the ledger never
+/// disagree. No-op when the patch has no routing decision (reconciliation,
+/// the slash poller, any caller other than dispatchArbitrumSettlement).
+function mirrorRouting(intentId: string, routing: Partial<RoutingDecisionFields> | undefined): void {
+  if (routing?.routingReason === undefined) return;
+  setSolverRouting(intentId, { solver: routing.selectedSolver ?? null, tier: routing.tierAtSelection ?? null, reason: routing.routingReason });
+}
+
 /// The "no collateral posted" refusal path: alert, record the reason, mark the
 /// ledger collateral_failed, mirror it for display. The user's only recourse
 /// is cancelIntent after expiry, exactly like an intent no solver ever
@@ -586,6 +595,7 @@ export function refuseArbitrumSettlement(intentId: `0x${string}`, json: ProofOut
   alert(`intent 0x${intentIdHex}: ${reason}`);
   recordAlertReason(intentId, reason);
   setArbitrumStage(intentId, "collateral_failed", { ...ledgerPatch, expiry: json.expiry });
+  mirrorRouting(intentId, ledgerPatch);
   mirrorDisplay(intentId, { stage: "collateral_failed", reason });
 }
 
@@ -629,6 +639,7 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
     // (setArbitrumStage spreads {...prev, ...patch}) carries it forward
     // without needing to repeat it.
     setArbitrumStage(intentId, "posting_collateral", { collateralTxHash: hash, expiry: json.expiry, solver: deps.solverAddress, ...deps.routing });
+    mirrorRouting(intentId, deps.routing);
     mirrorDisplay(intentId, { stage: "posting_collateral", collateralTxHash: hash });
   });
   if (!collateralOutcome.ok) {
@@ -636,6 +647,7 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
     alert(`intent 0x${intentIdHex}: ${reason}`);
     recordAlertReason(intentId, reason);
     setArbitrumStage(intentId, "collateral_failed", { ...deps.routing, collateralTxHash: collateralOutcome.txHash, expiry: json.expiry });
+    mirrorRouting(intentId, deps.routing);
     mirrorDisplay(intentId, { stage: "collateral_failed", collateralTxHash: collateralOutcome.txHash, reason });
     return;
   }
