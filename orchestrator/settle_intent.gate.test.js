@@ -248,6 +248,66 @@ async function runAsyncChecks() {
     check('threw', error !== null);
     check('error message includes the label and timeout', error !== null && /stalled call timed out after 30ms/.test(error.message));
   }
+
+  // Gate p3-hang: the live incident. The child finished its work but never
+  // exited, because waitForGo() left stdin flowing and the parent kept its
+  // end of the pipe open. These spawn a real child that uses the real
+  // waitForGo/runAsScript, with the parent writing GO via write(), NOT end(),
+  // exactly as listener.ts did, so the pipe stays open throughout.
+  const { spawn } = require('child_process');
+  function runChild(body, { killAfterMs }) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const src = `const { waitForGo, runAsScript } = require(${JSON.stringify(__dirname + '/settle_intent.js')});\n${body}`;
+      const child = spawn('node', ['-e', src], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '';
+      let killed = false;
+      child.stdout.on('data', (d) => {
+        out += d.toString();
+        if (d.toString().includes('SETTLING_SIG:')) child.stdin.write('GO\n');
+      });
+      const timer = setTimeout(() => {
+        killed = true;
+        child.kill('SIGKILL');
+      }, killAfterMs);
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({ code, killed, elapsed: Date.now() - start, out });
+      });
+    });
+  }
+
+  console.log('[gate-test] 17) control: the OLD shape (no explicit exit) never exits while the parent holds stdin open — reproduces the incident');
+  {
+    const r = await runChild(
+      `(async () => { console.log('SETTLING_SIG:x'); await waitForGo(); console.log('DONE'); })();`,
+      { killAfterMs: 1500 }
+    );
+    check('child reached the end of its work', r.out.includes('DONE'));
+    check('child did NOT exit on its own (had to be killed)', r.killed);
+  }
+
+  console.log('[gate-test] 18) runAsScript: success exits 0 promptly even though the parent never closes stdin');
+  {
+    const r = await runChild(
+      `runAsScript(async () => { console.log('SETTLING_SIG:x'); await waitForGo(); console.log('DONE'); });`,
+      { killAfterMs: 5000 }
+    );
+    check('child reached the end of its work', r.out.includes('DONE'));
+    check('exited on its own (not killed)', !r.killed);
+    check('exit code 0', r.code === 0);
+    check('exited well before the 5s kill ceiling', r.elapsed < 4000);
+  }
+
+  console.log('[gate-test] 19) runAsScript: a failure after GO still exits 1 (listener.ts\'s code !== 0 path)');
+  {
+    const r = await runChild(
+      `runAsScript(async () => { console.log('SETTLING_SIG:x'); await waitForGo(); throw new Error('boom'); });`,
+      { killAfterMs: 5000 }
+    );
+    check('exited on its own (not killed)', !r.killed);
+    check('exit code 1', r.code === 1);
+  }
 }
 
 runAsyncChecks().then(() => {

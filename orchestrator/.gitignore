@@ -5,4 +5,4 @@ dist/
 state/
 settled_intents.json
 arbitrum_settled_intents.json
-orchestrator/solver_stats_cache.json
+solver_stats_cache.json

@@ -90,7 +90,29 @@ async function pollForConfirmation(connection, signature, lastValidBlockHeight, 
   }
 }
 
-module.exports = { weiToLamports, normalizeProofHashHex, pollForConfirmation, withTimeout };
+// Gate p3-hang: the process must EXIT on success too, explicitly. waitForGo()
+// puts process.stdin into flowing mode, and listener.ts keeps its end of the
+// stdin pipe open, so after runSettlement() resolved the event loop still had
+// a live handle and the process sat idle (State S) forever. listener.ts only
+// resolves runSolanaPayout on the child's "close" event, and that call runs
+// inside the one-at-a-time ProverQueue job, so every later intent's prover
+// never started. The payout itself had landed, and the periodic
+// reconcileSettlingLedger pass finished those intents, which hid the hang.
+function runAsScript(main) {
+  return main().then(
+    () => process.exit(0),
+    (err) => {
+      // Fix 6 (Gate 5B-fix): must actually exit non-zero on failure (including
+      // the waitForGo() timeout below) — listener.ts's `code !== 0` alert path
+      // depends on it. The old `.catch(console.error)` swallowed the error and
+      // let the process exit 0 by default.
+      console.error(err);
+      process.exit(1);
+    }
+  );
+}
+
+module.exports = { weiToLamports, normalizeProofHashHex, pollForConfirmation, withTimeout, waitForGo, runAsScript };
 
 // Everything below only runs when this file is executed directly (`node
 // settle_intent.js`), never on require() — e.g. from a test importing
@@ -100,14 +122,7 @@ module.exports = { weiToLamports, normalizeProofHashHex, pollForConfirmation, wi
 // script's side effects behind require.main === module is the equivalent
 // fix here, and additionally makes weiToLamports importable in isolation.
 if (require.main === module) {
-  runSettlement().catch((err) => {
-    // Fix 6 (Gate 5B-fix): must actually exit non-zero on failure (including
-    // the waitForGo() timeout below) — listener.ts's `code !== 0` alert path
-    // depends on it. The old `.catch(console.error)` swallowed the error and
-    // let the process exit 0 by default.
-    console.error(err);
-    process.exit(1);
-  });
+  runAsScript(runSettlement);
 }
 
 // Fix 6 (Gate 5B-fix): blocks after printing SETTLING_SIG until the parent

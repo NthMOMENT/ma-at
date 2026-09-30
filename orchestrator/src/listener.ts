@@ -416,7 +416,10 @@ async function runSolanaPayout(intentId: string, json: ProofOutputJson, payoutDe
           markSettling(json.intent_id, m[1]);
           setSettling(json.intent_id, m[1]);
           console.log(`[SETTLE] intent ${intentId}: payout tx signed (sig ${m[1]}) — recorded "settling" before broadcast`);
-          settler.stdin.write("GO\n");
+          // end(), not just write(): the child needs nothing more on stdin,
+          // and an open pipe alone kept it alive after it finished (Gate
+          // p3-hang; settle_intent.js now also exits explicitly).
+          settler.stdin.end("GO\n");
         }
       }
     });
