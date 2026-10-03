@@ -106,6 +106,15 @@ export function recordCapacityError(url: string, nowMs: number, cooldownSec: num
   }
 }
 
+/// A JSON-RPC error carrying its numeric `code`, which viem's buildRequest
+/// maps to a typed error (e.g. -32000 -> InvalidInputRpcError). A code-less
+/// Error becomes UnknownRpcError instead, and watchContractEvent only
+/// re-creates an expired filter on InvalidInputRpcError — so dropping the
+/// code left every watcher stuck on "filter not found" until a restart.
+function jsonRpcError(code: number, message: string, prefix: string): Error {
+  return Object.assign(new Error(`${prefix}RPC error ${code}: ${message}`), { code });
+}
+
 /// A single HTTP attempt against one URL, aborted after `timeoutMs` — same
 /// default (10s) and same failure mode (an AbortError) as viem's http().
 async function rpcPost(url: string, method: string, params: unknown, timeoutMs: number): Promise<unknown> {
@@ -119,11 +128,20 @@ async function rpcPost(url: string, method: string, params: unknown, timeoutMs: 
       signal: controller.signal,
     });
     if (!res.ok) {
+      // Like viem's http(): a non-2xx whose body is a valid JSON-RPC error
+      // (Alchemy answers an expired filter with 400 + -32000 "filter not
+      // found") is surfaced as that RPC error, not a bare HTTP failure.
+      // "HTTP <status>" stays in the message so isCapacityError still sees 429s.
+      const errBody = (await res.json().catch(() => undefined)) as { error?: { code?: unknown; message?: unknown } } | undefined;
+      const e = errBody?.error;
+      if (typeof e?.code === "number" && typeof e?.message === "string") {
+        throw jsonRpcError(e.code, e.message, `HTTP ${res.status} from RPC endpoint: `);
+      }
       throw new Error(`HTTP ${res.status} from RPC endpoint`);
     }
     const body = (await res.json()) as { error?: { code: number; message: string }; result?: unknown };
     if (body.error) {
-      throw new Error(`RPC error ${body.error.code}: ${body.error.message}`);
+      throw jsonRpcError(body.error.code, body.error.message, "");
     }
     return body.result;
   } finally {
