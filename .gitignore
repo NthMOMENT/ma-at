@@ -17,3 +17,13 @@ zk/proof_*.json
 zk/exec_*.json
 zk/*.tmp
 zk/.rpc_health.json
+
+# Secrets, local data and build/dependency output (any directory)
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+data/
+.next/
+node_modules/

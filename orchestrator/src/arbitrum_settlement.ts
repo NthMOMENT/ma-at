@@ -625,7 +625,7 @@ export async function runArbitrumSettlementSequence(deps: ArbitrumSettlementDeps
     deliveryMarginSec: DELIVERY_MARGIN_SEC,
   });
   if (!gate.ok) {
-    const reason = `Arbitrum settle gate REFUSED (failed: ${gate.failedChecks.join(", ")}) — no collateral posted; user can reclaim via cancelIntent once the intent expires`;
+    const reason = `Arbitrum settle gate REFUSED (failed: ${gate.failedChecks.join(", ")}) — not settled; user can reclaim on the source chain via cancelIntent after expiry (no solver collateral) or claimRefund 24h after expiry (solver collateral posted)`;
     refuseArbitrumSettlement(intentId, json, reason, deps.routing);
     return;
   }

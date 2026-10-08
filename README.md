@@ -38,7 +38,7 @@ Maat is a cross-chain intent protocol. A user signs one transaction on the sourc
 - Solana is the only destination.
 - TRON Nile and Robinhood Chain Testnet contracts are deployed, but their intents are not proven or settled yet (shown as "coming soon").
 - One intent per transaction.
-- A hardened contract revision (IntentManager v3 — fixes two fund-lock edge cases found in an independent audit, see [Security](#security)) is written, tested, and reviewed, but not yet deployed. The live contract is v2.
+- The orchestrator does not replay missed events. An intent submitted while it is down is never proven or settled; its funds can only be reclaimed by the owner (`cancelIntent` after expiry, or `claimRefund` 24 hours after expiry if a solver posted collateral).
 
 ## Architecture (current)
 
@@ -100,19 +100,37 @@ The frontend (ma-at.xyz) lives in a separate repository.
 
 | Network | Address | Explorer |
 | --- | --- | --- |
-| Arbitrum Sepolia (v2) | `0xa3d4B948593334E55F0caC52DE406381e7052eAa` | [Arbiscan](https://sepolia.arbiscan.io/address/0xa3d4B948593334E55F0caC52DE406381e7052eAa) |
+| Arbitrum Sepolia (v3) | `0x19a315C0f6369f419073F9c13A3755221A4BceD6` | [Arbiscan](https://sepolia.arbiscan.io/address/0x19a315C0f6369f419073F9c13A3755221A4BceD6) |
 | Robinhood Chain Testnet | `0xcA6bf2D574209D49515a9Eeb61E27924edE28860` | [Explorer](https://explorer.testnet.chain.robinhood.com/address/0xcA6bf2D574209D49515a9Eeb61E27924edE28860) |
 | TRON Nile Testnet | `TW1PqkjksxFUefywyYYNHS4P2jeQaXzJWe` | [Tronscan](https://nile.tronscan.org/#/contract/TW1PqkjksxFUefywyYYNHS4P2jeQaXzJWe) |
 | Solana Devnet (program) | `9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv` | |
 
 Current SP1 verification key: `0x000c653a242999b53decd2c3d31fc211e432b38eb4ead432b789607eb8621937`
 
+## Agent interface (A2A-style, testnet)
+
+A2A-style JSON-RPC interface; not full A2A spec conformance. Testnet only (Arbitrum Sepolia). Agent card: `https://ma-at.xyz/.well-known/agent-card.json`; endpoint: `POST https://ma-at.xyz/api/a2a` (JSON-RPC 2.0, single requests).
+
+The card follows the A2A v1.0 Agent Card fields and declares a custom binding (`https://ma-at.xyz/bindings/maat-jsonrpc/v0`). It does not implement the standard A2A JSON-RPC binding or tasks/messages — only the three methods below.
+
+| Method | Price ([x402](https://github.com/coinbase/x402) v2, testnet USDC on Arbitrum Sepolia) | What it does |
+| --- | --- | --- |
+| `submit_intent` | 0.01 USDC | Returns an unsigned `submitIntent` transaction; the agent signs and broadcasts it. Maat never holds keys or funds. |
+| `query_intent` | 0.001 USDC | On-chain status, reclaim state and public proof status for an `intentId`. |
+| `register_prover` | free | Joins the prover waitlist. The wallet is claimed, not verified. |
+
+Payments are self-facilitated: the server verifies and settles each x402 payment itself (EIP-3009 `transferWithAuthorization`), with the facilitator's gas-paying key held server-side on the web host. That is acceptable for testnet only; mainnet would need a separate settlement service. Payments must match the price exactly. Replay protection is the token's own EIP-3009 nonce — a reused authorization is rejected. Only EOA payers have been tested; smart-contract-wallet payers are untested.
+
+What is charged: every paid call that settles is charged, including a `query_intent` for an intent that is not found (the answer "not found" is the result you paid for). A call rejected for invalid params or a rate limit is never charged: both checks run before any payment is verified or settled. A paid call is also refused with HTTP 503 and not charged if the facilitator's gas balance is below 0.002 ETH or the global limit of 300 settlements per rolling hour has been reached.
+
 ---
 
 ## Security
 
 - **Implemented:** the ZK receipt-inclusion proof, the six-check settle gate, the crash-safe settlement ledger, pausable contracts, and circuit breakers.
-- **Internal automated review:** contracts were checked with [glassofbeer.ai/heist](https://glassofbeer.ai/heist), our own adversarial exploit agent. This is an in-house tool, not a third-party audit. Latest run: Sept 27, 2026, against commit `bb3e7c0` (IntentManager v2) — 8/8 tested invariants held (no double-payout, no unauthorized settlement/slash, no premature refund, reentrancy blocked). Two findings (both fund-lock edge cases under specific future conditions, neither exploitable on the current live deployment) are fixed in a reviewed v3, not yet deployed. [Full report](./docs/audits/2026-09-27-intentmanager-v2-heist-audit.md).
+- **Internal automated review:** contracts were checked with [glassofbeer.ai/heist](https://glassofbeer.ai/heist), our own adversarial exploit agent. This is an in-house tool, not a third-party audit. Latest run: Sept 27, 2026, against commit `bb3e7c0` (IntentManager v2) — 8/8 tested invariants held (no double-payout, no unauthorized settlement/slash, no premature refund, reentrancy blocked). Two findings (both fund-lock edge cases under specific future conditions, neither exploitable on the current live deployment) are fixed in v3, deployed Oct 4, 2026. [Full report](./docs/audits/2026-09-27-intentmanager-v2-heist-audit.md).
+- **claimRefund (the fund-recovery escape hatch)** was tested on Arbitrum Sepolia: intent `0x2e942cfc3af10c00651daafe009e9374808721b094477f40ae25977e74cceff9` had solver collateral posted, was never settled, and was reclaimed by its owner after expiry + 24h — escrow refunded, the solver's collateral forfeited to the treasury, final on-chain status Refunded. Claim tx: [`0x828a0c5fd0b962fb2b4001cdf8822055688f79a30626f4cf81f2b5f5c4a4bc8e`](https://sepolia.arbiscan.io/tx/0x828a0c5fd0b962fb2b4001cdf8822055688f79a30626f4cf81f2b5f5c4a4bc8e). It was also checked earlier via fork simulation against the deployed v3 bytecode (boundary conditions, access control, double-call guard).
+- **cancelIntent** was also live-tested on Arbitrum Sepolia: intent `0xcfc68d82d92458ac7729940a23ea8657e98685497c66519def1440aed7e77ee7`, no solver collateral, cancelled by its owner after expiry, final on-chain status Expired. Cancel tx: [`0xc38d77f5ae95ec85a134d830d9f1abbaf77ac18e18b1712349d7d2af64db066b`](https://sepolia.arbiscan.io/tx/0xc38d77f5ae95ec85a134d830d9f1abbaf77ac18e18b1712349d7d2af64db066b).
 - **Planned before mainnet:** an external third-party audit.
 
 ## The risk framework
@@ -125,9 +143,7 @@ Maat applies credit-risk principles to solver infrastructure. These are design g
 - A solver fronting funds before L1 finality is extending credit; its tier sets that credit limit.
 
 ## Roadmap
-
-- Deploy IntentManager v3 (independently audited fund-lock fixes), alongside the changes below.
-- Solver credit scoring and tiered routing.
+- Automated credit scoring to assign/update solver tiers (tier-based routing itself is live).
 - On-chain proof verification on Solana (Groth16) and on-chain replay protection.
 - ZK proof of L1 finality.
 - Proving on dedicated hardware or a prover network, to remove the one-at-a-time limit.

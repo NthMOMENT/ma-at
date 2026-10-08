@@ -370,7 +370,7 @@ export async function dispatchArbitrumSettlement(deps: DispatchDeps, intentId: `
   console.log(`[ROUTING] intent ${intentId}: ${selection.reason}`);
 
   if (!selection.solver) {
-    const reason = `Arbitrum solver routing REFUSED (${selection.reason}) — no collateral posted; user can reclaim via cancelIntent once the intent expires`;
+    const reason = `Arbitrum solver routing REFUSED (${selection.reason}) — not settled; user can reclaim on the source chain via cancelIntent after expiry (no solver collateral) or claimRefund 24h after expiry (solver collateral posted)`;
     refuseArbitrumSettlement(intentId, json, reason, { selectedSolver: null, tierAtSelection: null, routingReason: selection.reason });
     return selection;
   }
