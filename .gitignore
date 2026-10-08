@@ -6,7 +6,6 @@ orchestrator/check_state.js
 orchestrator/init_program.js
 contracts/solana/maat/target/
 contracts/evm/.env
-contracts/evm/lib/
 contracts/evm/broadcast/
 contracts/evm/cache/
 contracts/evm/out/
