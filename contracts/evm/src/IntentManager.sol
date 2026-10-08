@@ -60,6 +60,13 @@ contract IntentManager is ReentrancyGuard, Pausable {
     /// postCollateral — replaces v1's "first caller with the right collateral wins".
     mapping(address => bool) public approvedSolvers;
 
+    /// @dev v3: forfeited solver collateral (slashSolver, claimRefund) is
+    /// credited here instead of pushed to `treasury` directly, so a treasury
+    /// that can't accept a bare ETH transfer (no receive(), reverting
+    /// fallback, paused multisig, ...) can never block the user/solver leg of
+    /// those calls — including claimRefund, the designated escape hatch.
+    mapping(address => uint256) public pendingTreasuryWithdrawals;
+
     uint256 public constant COLLATERAL_RATIO = 150;
 
     /// @dev v2: grace period after expiry before the intent owner can pull the
@@ -149,7 +156,14 @@ contract IntentManager is ReentrancyGuard, Pausable {
             if (msg.value != amount) revert IncorrectValue();
         } else {
             if (msg.value != 0) revert IncorrectValue();
+            // v3: fee-on-transfer / negative-rebase tokens deliver less than
+            // `amount` was asked for — record what was actually escrowed, not
+            // the nominal ask, so later payouts never try to send out more
+            // than this contract actually holds for this intent.
+            uint256 balBefore = IERC20(tokenAddress).balanceOf(address(this));
             IERC20(tokenAddress).safeTransferFrom(msg.sender, address(this), amount);
+            amount = IERC20(tokenAddress).balanceOf(address(this)) - balBefore;
+            if (amount == 0) revert InvalidAmount();
         }
 
         if (block.timestamp > lastVolumeReset + VOLUME_WINDOW) {
@@ -256,9 +270,11 @@ contract IntentManager is ReentrancyGuard, Pausable {
 
         _releaseFunds(user, amount, intent.tokenAddress);
 
-        // Collateral is always native ETH (see postCollateral), independent of the intent's asset.
-        (bool okTreasury,) = payable(treasury).call{value: collateral}("");
-        if (!okTreasury) revert EthTransferFailed();
+        // Collateral is always native ETH (see postCollateral), independent of
+        // the intent's asset. v3: credited for pull-withdrawal rather than
+        // pushed, so a treasury that can't accept a bare ETH transfer can
+        // never block this call (see pendingTreasuryWithdrawals).
+        pendingTreasuryWithdrawals[treasury] += collateral;
 
         emit SolverSlashed(intentId, solver, collateral, treasury);
     }
@@ -299,10 +315,22 @@ contract IntentManager is ReentrancyGuard, Pausable {
 
         _releaseFunds(msg.sender, amount, intent.tokenAddress);
 
-        (bool okTreasury,) = payable(treasury).call{value: collateral}("");
-        if (!okTreasury) revert EthTransferFailed();
+        // v3: credited for pull-withdrawal — see slashSolver and
+        // pendingTreasuryWithdrawals. Critically, this means a broken
+        // treasury can never block the escape hatch itself.
+        pendingTreasuryWithdrawals[treasury] += collateral;
 
         emit IntentRefunded(intentId, msg.sender, amount, collateral);
+    }
+
+    /// @notice Treasury pulls any collateral forfeited to it via slashSolver
+    /// or claimRefund. Pull-based so a broken/reverting treasury can never
+    /// block those calls (see pendingTreasuryWithdrawals).
+    function withdrawTreasury() external nonReentrant {
+        uint256 amount = pendingTreasuryWithdrawals[msg.sender];
+        pendingTreasuryWithdrawals[msg.sender] = 0;
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
     }
 
     /// @dev Releases an intent's escrowed `amount` — native ETH if tokenAddress is

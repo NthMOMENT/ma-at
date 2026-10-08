@@ -343,6 +343,8 @@ contract IntentManagerTest is Test {
         intentManager.slashSolver(intentId);
 
         assertEq(token.balanceOf(user), userTokenBefore + AMOUNT);
+        vm.prank(treasury);
+        intentManager.withdrawTreasury();
         assertEq(treasury.balance, treasuryEthBefore + collateral);
     }
 
@@ -441,6 +443,8 @@ contract IntentManagerTest is Test {
         intentManager.slashSolver(intentId);
 
         assertEq(user.balance, userBefore + AMOUNT);
+        vm.prank(treasury);
+        intentManager.withdrawTreasury();
         assertEq(treasury.balance, treasuryBefore + collateral);
     }
 
@@ -613,6 +617,8 @@ contract IntentManagerTest is Test {
         intentManager.claimRefund(intentId);
 
         assertEq(user.balance, userBefore + AMOUNT);
+        vm.prank(treasury);
+        intentManager.withdrawTreasury();
         assertEq(treasury.balance, treasuryBefore + collateral);
 
         (IntentManager.IntentStatus status,, uint256 collateralPosted) = _full(intentId);
