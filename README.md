@@ -35,10 +35,12 @@ Maat is a cross-chain intent protocol. A user signs one transaction on the sourc
 
 - Proofs run one at a time, ~7 minutes each (roughly 8 intents per hour).
 - Native ETH only as the source asset. ERC-20 intents are accepted by the contract but not routed.
+- Solver collateral is always ETH, and for ERC-20 intents the 150% ratio is applied to the raw token amount without any price or decimals valuation (Finding C in the v2 review, not fixed). ERC-20 intents should not be used with real funds until this is addressed.
 - Solana is the only destination.
 - TRON Nile and Robinhood Chain Testnet contracts are deployed, but their intents are not proven or settled yet (shown as "coming soon").
 - One intent per transaction.
 - The orchestrator does not replay missed events. An intent submitted while it is down is never proven or settled; its funds can only be reclaimed by the owner (`cancelIntent` after expiry, or `claimRefund` 24 hours after expiry if a solver posted collateral).
+- **Solana program (Devnet): build provenance, not verified as reproducible.** The program at `9nKpoMMP2ZX2bRudcXjpAS4VtSJBxiZ8wsM69LAkHikv` was built with `anchor build` (solana-cli 2.1.0, platform-tools v1.43, Anchor 0.31.0) in a local checkout of commit `db17e8a` and deployed with `anchor deploy` on 2026-09-21. Its sha256 as stored on-chain is `63bee0b4c3efc51bc07875869b142da9aaec9c475c0d0c2b9d34fb9dd1130c66` (executable hash `05c7928a94091a4fb001e76b0ab785706daea297b04ebd5b2529f69113252fcb`). It is **not verified as a reproducible build**: three local rebuilds of the same commit with the same toolchain each produced a different binary (the two compared section by section had identical size, dynamic symbols and relocations, but different `.text` and `.rodata`), so a byte-for-byte match with the chain could not be established, and no `solana-verify` attestation exists. A deterministic Docker-based build and attestation are planned after the hackathon submission.
 
 ## Architecture (current)
 
@@ -96,6 +98,24 @@ The frontend (ma-at.xyz) lives in a separate repository.
 
 `destinationWallet` is `bytes32`: raw 32-byte pubkey for Solana, left-padded for EVM, base58check-decoded and padded for TRON. Solana's destination chain ID is `1399811149`.
 
+## Build and test
+
+The EVM contracts (`contracts/evm`) use [Foundry](https://getfoundry.sh). OpenZeppelin Contracts and forge-std are git submodules, pinned to OpenZeppelin Contracts at `9a02119` and forge-std at `7239323` — both untagged upstream master commits that reproduce the exact sources the deployed IntentManager was built with.
+
+```bash
+git clone --recurse-submodules https://github.com/NthMOMENT/ma-at.git
+cd ma-at/contracts/evm
+forge test
+```
+
+If you cloned without `--recurse-submodules`, fetch the dependencies first (from the repository root):
+
+```bash
+git submodule update --init --recursive
+```
+
+`forge test` runs 45 tests (45 passing), including tests for fee-on-transfer escrow accounting, `withdrawTreasury`, and a treasury that cannot receive ETH.
+
 ## Deployed contracts
 
 | Network | Address | Explorer |
@@ -128,7 +148,8 @@ What is charged: every paid call that settles is charged, including a `query_int
 ## Security
 
 - **Implemented:** the ZK receipt-inclusion proof, the six-check settle gate, the crash-safe settlement ledger, pausable contracts, and circuit breakers.
-- **Internal automated review:** contracts were checked with [glassofbeer.ai/heist](https://glassofbeer.ai/heist), our own adversarial exploit agent. This is an in-house tool, not a third-party audit. Latest run: Sept 27, 2026, against commit `bb3e7c0` (IntentManager v2) — 8/8 tested invariants held (no double-payout, no unauthorized settlement/slash, no premature refund, reentrancy blocked). Two findings (both fund-lock edge cases under specific future conditions, neither exploitable on the current live deployment) are fixed in v3, deployed Oct 4, 2026. [Full report](./docs/audits/2026-09-27-intentmanager-v2-heist-audit.md).
+- **Internal automated review:** contracts were checked with [glassofbeer.ai/heist](https://glassofbeer.ai/heist), our own adversarial exploit agent. This is an in-house tool, not a third-party audit. Latest run: Sept 27, 2026, against commit `bb3e7c0` (IntentManager v2) — 8/8 tested invariants held (no double-payout, no unauthorized settlement/slash, no premature refund, reentrancy blocked). Two findings (both fund-lock edge cases under specific future conditions, neither exploitable on the current live deployment) are fixed in v3, deployed Oct 4, 2026. v3 source: commit [`e60b4d9`](https://github.com/NthMOMENT/ma-at/commit/e60b4d9); the deployed IntentManager at `0x19a315C0f6369f419073F9c13A3755221A4BceD6` was built from this source (runtime bytecode compared with the on-chain code after masking the deploy-time immutables and the build-path-dependent metadata hash). That review covered only v2 (commit `bb3e7c0`); its two High findings are fixed in v3, but those fixes were written and tested by the same reviewer (its own PoC suite plus the project's tests) and have not had a separate independent review. [Full report](./docs/audits/2026-09-27-intentmanager-v2-heist-audit.md).
+- **Source verification:** the deployed IntentManager v3 is verified on Sourcify with an exact match (creation and runtime bytecode, including the metadata hash): https://repo.sourcify.dev/421614/0x19a315C0f6369f419073F9c13A3755221A4BceD6. Verified source on Arbiscan: https://sepolia.arbiscan.io/address/0x19a315C0f6369f419073F9c13A3755221A4BceD6#code
 - **claimRefund (the fund-recovery escape hatch)** was tested on Arbitrum Sepolia: intent `0x2e942cfc3af10c00651daafe009e9374808721b094477f40ae25977e74cceff9` had solver collateral posted, was never settled, and was reclaimed by its owner after expiry + 24h — escrow refunded, the solver's collateral forfeited to the treasury, final on-chain status Refunded. Claim tx: [`0x828a0c5fd0b962fb2b4001cdf8822055688f79a30626f4cf81f2b5f5c4a4bc8e`](https://sepolia.arbiscan.io/tx/0x828a0c5fd0b962fb2b4001cdf8822055688f79a30626f4cf81f2b5f5c4a4bc8e). It was also checked earlier via fork simulation against the deployed v3 bytecode (boundary conditions, access control, double-call guard).
 - **cancelIntent** was also live-tested on Arbitrum Sepolia: intent `0xcfc68d82d92458ac7729940a23ea8657e98685497c66519def1440aed7e77ee7`, no solver collateral, cancelled by its owner after expiry, final on-chain status Expired. Cancel tx: [`0xc38d77f5ae95ec85a134d830d9f1abbaf77ac18e18b1712349d7d2af64db066b`](https://sepolia.arbiscan.io/tx/0xc38d77f5ae95ec85a134d830d9f1abbaf77ac18e18b1712349d7d2af64db066b).
 - **Planned before mainnet:** an external third-party audit.
